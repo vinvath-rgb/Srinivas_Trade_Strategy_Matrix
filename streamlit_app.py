@@ -1,12 +1,4 @@
-# --- bootstrap missing packages on Streamlit Cloud ---
-import sys, subprocess
-def _ensure(pkgs):
-    try:
-        for p in pkgs:
-            __import__(p.split("==")[0])
-    except ModuleNotFoundError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", *pkgs])
-_ensure(["yfinance", "pandas", "numpy", "streamlit"])
+
 # -----------------------------------------------------
 import streamlit as st
 import pandas as pd
