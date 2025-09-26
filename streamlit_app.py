@@ -1,10 +1,9 @@
-# Srini Algo Backtester — NSE bhavcopy + Yahoo -> Stooq with auto end-date snap
-# -----------------------------------------------------------------------------
-# For *.NS tickers: official NSE bhavcopy (EOD) with robust headers & dual-host fallback,
-# then Yahoo, then Stooq. For global tickers: Yahoo -> Stooq.
-# Auto-snaps "End date" to latest available trading day if user selects today/holiday.
+# Srini All-In-One Backtester
+# - NSE (India) via monthly bhavcopy ZIPs (official EOD) with optional prefetch step
+# - US/Global via yfinance -> Stooq fallback
+# - Per-ticker results (no strict date intersection)
+# - SMA/RSI, vol targeting, ATR stops, take-profit
 
-import os
 import io
 import time
 import zipfile
@@ -15,89 +14,71 @@ import streamlit as st
 import yfinance as yf
 from pandas_datareader import data as pdr
 
-st.set_page_config(page_title="Srini Algo Backtester", layout="wide")
-
+st.set_page_config(page_title="Srini Backtester (All-in-one)", layout="wide")
 
 # =========================
-# Helpers
+# General utilities
 # =========================
-def price_column(df: pd.DataFrame) -> str:
+def price_col(df: pd.DataFrame) -> str:
     return "Adj Close" if "Adj Close" in df.columns else "Close"
-
 
 def _to_ts(d):
     return pd.to_datetime(d).tz_localize(None)
 
-
 def rsi(series: pd.Series, lb: int = 14) -> pd.Series:
     delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
+    up, down = delta.clip(lower=0), -delta.clip(upper=0)
     roll_up = up.rolling(lb).mean()
     roll_down = down.rolling(lb).mean()
     rs = roll_up / (roll_down + 1e-12)
     return 100 - (100 / (1 + rs))
 
-
 def compute_atr(df: pd.DataFrame, lb: int = 14) -> pd.Series:
-    high = df["High"]
-    low = df["Low"]
-    close = df[price_column(df)]
+    high, low, close = df["High"], df["Low"], df[price_col(df)]
     prev_close = close.shift(1)
-    tr = pd.concat(
-        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
-        axis=1,
-    ).max(axis=1)
+    tr = pd.concat([(high - low).abs(),
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(lb).mean()
 
-
 def annualized_return(series: pd.Series, ppy: int = 252) -> float:
-    if series.empty:
-        return 0.0
+    if series.empty: return 0.0
     total = float((1 + series).prod())
     years = len(series) / ppy
-    return total ** (1 / years) - 1 if years > 0 else 0.0
-
+    return total ** (1 / max(years, 1e-9)) - 1
 
 def sharpe(series: pd.Series, rf: float = 0.0, ppy: int = 252) -> float:
-    if series.std() == 0 or series.empty:
-        return 0.0
+    if series.std() == 0 or series.empty: return 0.0
     excess = series - rf / ppy
     return float(np.sqrt(ppy) * excess.mean() / (excess.std() + 1e-12))
 
-
 def max_drawdown(equity: pd.Series):
-    if equity.empty:
-        return 0.0, None, None
+    if equity.empty: return 0.0, None, None
     roll_max = equity.cummax()
     dd = (equity / roll_max) - 1.0
     trough = dd.idxmin()
     peak = roll_max.loc[:trough].idxmax()
     return float(dd.min()), peak, trough
 
-
 def position_sizer(signal: pd.Series, returns: pd.Series, vol_target: float, ppy: int = 252) -> pd.Series:
     vol = returns.ewm(span=20, adjust=False).std() * np.sqrt(ppy)
     vol.replace(0, np.nan, inplace=True)
-    leverage = (vol_target / (vol + 1e-12)).clip(upper=5.0).fillna(0.0)
-    return signal * leverage
+    lev = (vol_target / (vol + 1e-12)).clip(upper=5.0).fillna(0.0)
+    return signal * lev
 
+def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series,
+                atr_stop_mult: float, tp_mult: float) -> pd.Series:
+    c = df[price_col(df)]
+    ret = c.pct_change().fillna(0.0)
+    pnl = pd.Series(0.0, index=c.index)
+    current_pos, entry = 0.0, np.nan
 
-def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series, atr_stop_mult: float, tp_mult: float) -> pd.Series:
-    """Close-to-close stop/TP simulation (simple & fast)."""
-    close = df[price_column(df)]
-    ret = close.pct_change().fillna(0.0)
-    pnl = pd.Series(0.0, index=close.index)
-    current_pos = 0.0
-    entry_price = np.nan
-
-    for i in range(len(close)):
-        s = float(pos.iloc[i])
-        c = float(close.iloc[i])
+    for i in range(len(c)):
+        s, px = float(pos.iloc[i]), float(c.iloc[i])
         a = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else np.nan
 
         if i == 0 or np.sign(s) != np.sign(current_pos):
-            entry_price = c
+            entry = px
         current_pos = s
 
         if current_pos == 0 or np.isnan(a):
@@ -105,39 +86,35 @@ def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series, atr_stop_mult:
             continue
 
         if current_pos > 0:
-            stop_level = entry_price * (1 - atr_stop_mult * a / max(entry_price, 1e-12))
-            tp_level   = entry_price * (1 + tp_mult     * a / max(entry_price, 1e-12))
-            if c <= stop_level:
+            stop = entry * (1 - atr_stop_mult * a / max(entry, 1e-12))
+            tp   = entry * (1 + tp_mult     * a / max(entry, 1e-12))
+            if px <= stop:
                 pnl.iloc[i] = 0.0
                 current_pos = 0.0
-            elif c >= tp_level:
-                pnl.iloc[i] = current_pos * (tp_mult * a / max(entry_price, 1e-12))
+            elif px >= tp:
+                pnl.iloc[i] = current_pos * (tp_mult * a / max(entry, 1e-12))
                 current_pos = 0.0
             else:
                 pnl.iloc[i] = current_pos * ret.iloc[i]
         else:
-            stop_level = entry_price * (1 + atr_stop_mult * a / max(entry_price, 1e-12))
-            tp_level   = entry_price * (1 - tp_mult     * a / max(entry_price, 1e-12))
-            if c >= stop_level:
+            stop = entry * (1 + atr_stop_mult * a / max(entry, 1e-12))
+            tp   = entry * (1 - tp_mult     * a / max(entry, 1e-12))
+            if px >= stop:
                 pnl.iloc[i] = 0.0
                 current_pos = 0.0
-            elif c <= tp_level:
-                pnl.iloc[i] = current_pos * (-tp_mult * a / max(entry_price, 1e-12))
+            elif px <= tp:
+                pnl.iloc[i] = current_pos * (-tp_mult * a / max(entry, 1e-12))
                 current_pos = 0.0
             else:
                 pnl.iloc[i] = current_pos * ret.iloc[i]
-
     return pnl
 
-
 def sma_signals(price: pd.Series, fast: int, slow: int) -> pd.Series:
-    ma_f = price.rolling(fast).mean()
-    ma_s = price.rolling(slow).mean()
+    ma_f, ma_s = price.rolling(fast).mean(), price.rolling(slow).mean()
     sig = pd.Series(0.0, index=price.index)
     sig[ma_f > ma_s] = 1.0
     sig[ma_f < ma_s] = -1.0
     return sig.fillna(0.0)
-
 
 def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> pd.Series:
     r = rsi(price, lb=rsi_lb)
@@ -146,12 +123,11 @@ def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> p
     sig[r > rsi_sell] = -1.0
     return sig.fillna(0.0)
 
-
 # =========================
-# NSE bhavcopy fetcher (robust)
+# NSE monthly bhavcopy (official EOD)
 # =========================
-_session = requests.Session()
-_session.headers.update({
+NSE = requests.Session()
+NSE.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
@@ -159,233 +135,241 @@ _session.headers.update({
     "Referer": "https://www.nseindia.com/",
 })
 
-def _nse_prime_cookies():
+def _nse_prime():
     try:
-        _session.get("https://www.nseindia.com/", timeout=10)
+        NSE.get("https://www.nseindia.com/", timeout=10)
     except Exception:
         pass
 
-def _bhav_urls_for(date: pd.Timestamp) -> list[str]:
-    y   = date.strftime("%Y")
-    mon = date.strftime("%b").upper()      # JAN
-    dmy = date.strftime("%d%b%Y").upper()  # 01JAN2024
-    # Try both hosts; NSE flips between them
+def _monthly_urls_for(anchor: pd.Timestamp) -> list[str]:
+    y   = anchor.strftime("%Y")
+    mon = anchor.strftime("%b").upper()     # SEP
+    fname = f"cm{mon}{y}bhav.csv.zip"       # cmSEP2025bhav.csv.zip
     return [
-        f"https://archives.nseindia.com/content/historical/EQUITIES/{y}/{mon}/cm{dmy}bhav.csv.zip",
-        f"https://www1.nseindia.com/content/historical/EQUITIES/{y}/{mon}/cm{dmy}bhav.csv.zip",
+        f"https://archives.nseindia.com/content/historical/EQUITIES/{y}/{mon}/{fname}",
+        f"https://www1.nseindia.com/content/historical/EQUITIES/{y}/{mon}/{fname}",
     ]
 
 @st.cache_data(show_spinner=False)
-def _nse_bhav_exists(date: pd.Timestamp) -> bool:
-    """Check if any host has a bhavcopy for this date (HEAD/GET)."""
-    _nse_prime_cookies()
-    for url in _bhav_urls_for(date):
-        try:
-            r = _session.head(url, timeout=8, allow_redirects=True)
-            if r.status_code == 200:
-                return True
-        except Exception:
-            pass
-    return False
+def fetch_month_df(anchor: pd.Timestamp, debug_http: bool = False, max_retries: int = 2) -> pd.DataFrame:
+    """Download one monthly ZIP; return normalized DataFrame with DATE/SYMBOL/OHLCV/Adj Close."""
+    _nse_prime()
+    urls = _monthly_urls_for(anchor)
+    for url in urls:
+        for attempt in range(1, max_retries + 1):
+            try:
+                r = NSE.get(url, timeout=25)
+                if debug_http: st.write(f"GET {url} -> {r.status_code}")
+                if r.status_code == 200:
+                    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                        with z.open(z.namelist()[0]) as f:
+                            raw = pd.read_csv(f)
+                    # Robust date parse (fixes tiny windows)
+                    raw["DATE"] = pd.to_datetime(
+                        raw["TIMESTAMP"].astype(str).str.strip(),
+                        format="%d-%b-%Y", errors="coerce"
+                    )
+                    raw = raw.dropna(subset=["DATE"])
+                    df = pd.DataFrame({
+                        "DATE": raw["DATE"],
+                        "SYMBOL": raw["SYMBOL"].astype(str).str.upper(),
+                        "Open": pd.to_numeric(raw["OPEN"], errors="coerce"),
+                        "High": pd.to_numeric(raw["HIGH"], errors="coerce"),
+                        "Low":  pd.to_numeric(raw["LOW"],  errors="coerce"),
+                        "Close":pd.to_numeric(raw["CLOSE"],errors="coerce"),
+                        "Volume": pd.to_numeric(raw["TOTTRDQTY"], errors="coerce"),
+                    })
+                    df["Adj Close"] = df["Close"]
+                    return df.dropna(subset=["DATE"]).sort_values("DATE").reset_index(drop=True)
+                elif r.status_code in (403, 429):
+                    time.sleep(1.2 * attempt); continue
+                else:
+                    break
+            except Exception:
+                time.sleep(0.8 * attempt); continue
+    return pd.DataFrame()
 
-def snap_to_latest_available(end_dt: pd.Timestamp, max_lookback_days: int = 10) -> pd.Timestamp:
-    """
-    If end_dt doesn't have a bhavcopy yet (today/holiday), walk back until we find one.
-    Caps at ~2 weeks to avoid long loops.
-    """
-    end_dt = end_dt.normalize()
-    for _ in range(max_lookback_days):
-        if _nse_bhav_exists(end_dt):
-            return end_dt
-        end_dt -= pd.Timedelta(days=1)
-    return end_dt  # may still be unavailable; loader will handle
+def _month_periods(start_dt: pd.Timestamp, end_dt: pd.Timestamp):
+    return pd.period_range(start=start_dt, end=end_dt, freq="M")
 
 @st.cache_data(show_spinner=False)
-def fetch_nse_bhavcopy(symbol_no_suffix: str, start: str, end: str,
-                       sleep_sec: float = 0.5, max_retries: int = 2,
-                       debug_http: bool = False) -> pd.DataFrame:
-    """
-    Download official NSE daily 'bhavcopy' ZIPs and extract rows for a single symbol (e.g., 'RELIANCE', 'TATASTEEL').
-    Returns DataFrame index=DATE with columns: Open, High, Low, Close, Adj Close, Volume
-    """
-    sym = symbol_no_suffix.upper().strip()
-    start_dt = pd.to_datetime(start).normalize()
-    end_dt   = pd.to_datetime(end).normalize()
-    if end_dt < start_dt:
-        return pd.DataFrame()
-
-    _nse_prime_cookies()
-
-    # Business days range (still includes Indian holidays but skips weekends).
-    days = pd.bdate_range(start_dt, end_dt, freq="C")
-
+def concat_months_cached(start_dt: pd.Timestamp, end_dt: pd.Timestamp, debug_http: bool = False) -> pd.DataFrame:
+    """Fetch all months in range (cached per month) and concatenate them."""
     frames = []
-    for d in days:
-        urls = _bhav_urls_for(d)
-        got_day = False
-        for url in urls:
-            for attempt in range(1, max_retries + 1):
-                try:
-                    r = _session.get(url, timeout=15)
-                    status = r.status_code
-                    if debug_http:
-                        st.write(f"NSE GET {url} -> {status}")
-                    if status == 200:
-                        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-                            with z.open(z.namelist()[0]) as f:
-                                df = pd.read_csv(f)
-                        m = df["SYMBOL"].astype(str).str.upper() == sym
-                        if m.any():
-                            df = df.loc[m, ["TIMESTAMP","OPEN","HIGH","LOW","CLOSE","TOTTRDQTY"]].copy()
-                            df.rename(columns={
-                                "TIMESTAMP":"DATE",
-                                "OPEN":"Open","HIGH":"High","LOW":"Low","CLOSE":"Close",
-                                "TOTTRDQTY":"Volume"
-                            }, inplace=True)
-                            df["DATE"] = pd.to_datetime(df["DATE"])
-                            df["Adj Close"] = df["Close"]
-                            df = df.sort_values("DATE")
-                            frames.append(df)
-                        got_day = True
-                        break
-                    elif status in (403, 429):
-                        time.sleep(1.0 * attempt)
-                        continue
-                    else:
-                        break
-                except Exception:
-                    time.sleep(0.8 * attempt)
-                    continue
-            if got_day:
-                break
-        time.sleep(sleep_sec)
-
+    months = list(_month_periods(start_dt, end_dt))
+    if months:
+        prog = st.progress(0, text="Fetching NSE monthly files…")
+    for i, m in enumerate(months, start=1):
+        anchor = pd.Timestamp(year=m.year, month=m.month, day=1)
+        dfm = fetch_month_df(anchor, debug_http=debug_http)
+        if not dfm.empty:
+            frames.append(dfm)
+        if months:
+            prog.progress(i / len(months), text=f"Fetched {m.strftime('%b %Y')} ({i}/{len(months)})")
+    if months:
+        prog.empty()
     if not frames:
         return pd.DataFrame()
+    big = pd.concat(frames, ignore_index=True)
+    big = big.dropna(subset=["DATE"]).sort_values("DATE").reset_index(drop=True)
+    return big
 
-    out = pd.concat(frames, ignore_index=True)
-    out = out.drop_duplicates(subset="DATE").sort_values("DATE").set_index("DATE")
-    for c in ["Open","High","Low","Close","Adj Close","Volume"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-    return out.dropna(how="all")
-
+# Session store (Step-1 cache)
+if "nse_store" not in st.session_state:
+    st.session_state.nse_store = pd.DataFrame()
+if "nse_ready" not in st.session_state:
+    st.session_state.nse_ready = False
 
 # =========================
-# Data loader (NSE -> Yahoo -> Stooq) with auto-snap
+# Loaders
 # =========================
 @st.cache_data(show_spinner=False)
-def load_prices(tickers_raw: str, start, end, debug_http: bool = False):
-    """
-    For *.NS: First snap 'end' to latest available bhavcopy date, then try NSE official.
-    Fallbacks: Yahoo, then Stooq. Others: Yahoo -> Stooq.
-    Returns: {ticker: DataFrame} aligned on common dates.
-    """
-    tickers = [t.strip() for t in tickers_raw.split(",") if t.strip()]
-    if not tickers:
-        return {}
+def load_prices_from_store(store: pd.DataFrame, tickers_raw: str, start: str, end: str) -> dict:
+    """Use pre-fetched NSE store for *.NS tickers; others ignored here."""
+    out = {}
+    if store is None or store.empty:
+        return out
+    sdt = _to_ts(start).date()
+    edt = _to_ts(end).date()
+    for t in [x.strip() for x in tickers_raw.split(",") if x.strip()]:
+        T = t.upper()
+        if not (T.endswith(".NS") or T.isalpha()):
+            continue
+        base = T.replace(".NS", "")
+        sub = store[store["SYMBOL"] == base].copy()
+        if sub.empty:
+            continue
+        sub = sub[(sub["DATE"].dt.date >= sdt) & (sub["DATE"].dt.date <= edt)]
+        if sub.empty:
+            continue
+        df = sub[["DATE","Open","High","Low","Close","Adj Close","Volume"]].sort_values("DATE").set_index("DATE")
+        out[T] = df.dropna(how="all")
+    return out
+
+@st.cache_data(show_spinner=False)
+def load_prices_live(tickers_raw: str, start, end) -> dict:
+    """US/Global via yfinance -> Stooq. Also tries NSE monthly (on-the-fly) for .NS if store not available."""
+    tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
+    if not tickers: return {}
 
     start = _to_ts(start)
     end   = _to_ts(end)
+    end_inclusive = end + pd.Timedelta(days=1)
 
-    # Auto-snap end to latest available NSE bhavcopy if any .NS is requested
-    has_ns = any(t.upper().endswith(".NS") or (".NS" not in t.upper() and t.isalpha()) for t in tickers)
-    snapped_end = snap_to_latest_available(end) if has_ns else end
-    end_inclusive = snapped_end + pd.Timedelta(days=1)
+    results = {}
 
-    results: dict[str, pd.DataFrame] = {}
+    # 1) Try yfinance batch for all tickers (works for many .NS as well)
+    try:
+        df = yf.download(
+            tickers=tickers,
+            start=start, end=end_inclusive,
+            interval="1d",
+            auto_adjust=False, progress=False,
+            group_by="ticker", threads=False, timeout=60, proxy=None
+        )
+        if isinstance(df.columns, pd.MultiIndex):
+            lvl0 = df.columns.get_level_values(0)
+            for t in tickers:
+                if t in lvl0:
+                    sub = df[t].dropna(how="all").copy()
+                    if not sub.empty:
+                        results[t] = sub
+        else:
+            if not df.empty and len(tickers) == 1:
+                results[tickers[0]] = df.dropna(how="all").copy()
+    except Exception:
+        pass
 
-    # 1) NSE official for .NS
-    for t in [x for x in tickers if x.upper().endswith(".NS")]:
-        base = t.split(".")[0].upper()
-        dfn = fetch_nse_bhavcopy(base, start.strftime("%Y-%m-%d"), snapped_end.strftime("%Y-%m-%d"),
-                                 debug_http=debug_http)
-        if not dfn.empty:
-            results[t.upper()] = dfn
-
-    # 2) Yahoo batch for the rest (and any .NS that NSE failed to fetch)
-    remaining = [t.upper() for t in tickers if t.upper() not in results]
-    if remaining:
-        try:
-            df = yf.download(
-                tickers=remaining,
-                start=start,
-                end=end_inclusive,
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                group_by="ticker",
-                threads=False,
-                timeout=60,
-                proxy=None,
-            )
-            if isinstance(df.columns, pd.MultiIndex):
-                lvl0 = df.columns.get_level_values(0)
-                for t in remaining:
-                    if t in lvl0:
-                        sub = df[t].dropna(how="all").copy()
-                        if not sub.empty:
-                            results[t] = sub
-            else:
-                if not df.empty and len(remaining) == 1:
-                    results[remaining[0]] = df.dropna(how="all").copy()
-        except Exception:
-            pass
-
-    # 3) Yahoo per-ticker retries
-    missing = [t for t in remaining if t not in results]
-    for t in missing:
+    # 2) Retry per ticker
+    remaining = [t for t in tickers if t not in results]
+    for t in remaining:
         try:
             dft = yf.download(
                 t, start=start, end=end_inclusive, interval="1d",
-                auto_adjust=False, progress=False, threads=False,
-                timeout=60, proxy=None
+                auto_adjust=False, progress=False, threads=False, timeout=60, proxy=None
             ).dropna(how="all")
             if not dft.empty:
                 results[t] = dft
         except Exception:
             pass
-        time.sleep(1.0)
+        time.sleep(0.8)
 
-    # 4) Stooq fallback
-    still_missing = [t for t in remaining if t not in results]
-    for t in still_missing:
+    # 3) For any .NS still missing, try NSE monthly on-the-fly (single month range)
+    still = [t for t in remaining if t not in results and t.endswith(".NS")]
+    for t in still:
+        base = t.replace(".NS", "")
+        sdt = _to_ts(start); edt = _to_ts(end)
+        months = list(_month_periods(sdt, edt))
+        frames = []
+        for m in months:
+            anchor = pd.Timestamp(year=m.year, month=m.month, day=1)
+            dfm = fetch_month_df(anchor, debug_http=False)
+            if not dfm.empty:
+                sub = dfm[dfm["SYMBOL"] == base].copy()
+                if not sub.empty:
+                    sub = sub[(sub["DATE"] >= sdt) & (sub["DATE"] <= edt)]
+                    if not sub.empty:
+                        sub["Adj Close"] = sub["Close"]
+                        frames.append(sub)
+        if frames:
+            tmp = pd.concat(frames, ignore_index=True).sort_values("DATE")
+            dfx = tmp[["DATE","Open","High","Low","Close","Adj Close","Volume"]].set_index("DATE")
+            results[t] = dfx
+
+    # 4) Stooq fallback for whatever is still missing
+    still2 = [t for t in tickers if t not in results]
+    for t in still2:
         try:
             dft = pdr.DataReader(t, "stooq", start=start, end=end_inclusive)
             if dft is not None and not dft.empty:
                 dft = dft.sort_index()
                 if "Adj Close" not in dft.columns and "Close" in dft.columns:
                     dft["Adj Close"] = dft["Close"]
-                keep = ["Open","High","Low","Close","Adj Close","Volume"]
+                keep = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in dft.columns]
                 dft = dft[keep].dropna(how="all")
                 if not dft.empty:
                     results[t] = dft
         except Exception:
             pass
 
-    if not results:
-        return {}
+    # Clean, no intersection
+    cleaned = {}
+    for t, df in results.items():
+        if df is None or df.empty: continue
+        keep = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in df.columns]
+        df = df[keep].sort_index().dropna(how="all")
+        if not df.empty:
+            cleaned[t] = df
+    return cleaned
 
-    # Align calendars (intersection)
-    common_idx = sorted(set.intersection(*[set(df.index) for df in results.values()]))
-    if not common_idx:
-        return {}
-    aligned = {t: df.loc[common_idx].copy() for t, df in results.items() if not df.empty}
-    return aligned
+def load_prices_all(tickers: str, start: str, end: str) -> dict:
+    """
+    Unified entry:
+      - If Step-1 NSE store is ready, use it for .NS tickers.
+      - For others, or any missing .NS, use live loader (yfinance -> Stooq -> NSE on-the-fly).
+    """
+    data = {}
 
+    # 1) Use cached NSE store if present
+    if st.session_state.get("nse_ready") and not st.session_state.get("nse_store", pd.DataFrame()).empty:
+        from_store = load_prices_from_store(st.session_state.nse_store, tickers, start, end)
+        data.update(from_store)
+
+    # 2) For anything still missing (including all non-.NS), hit live loaders
+    wanted = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    missing = [t for t in wanted if t not in data]
+    if missing:
+        live = load_prices_live(",".join(missing), start, end)
+        data.update(live)
+
+    return data
 
 # =========================
-# Backtest (per ticker)
+# Backtest
 # =========================
-def backtest(
-    df: pd.DataFrame,
-    strategy: str,
-    params: dict,
-    vol_target: float,
-    long_only: bool,
-    atr_stop: float,
-    take_profit: float,
-):
-    price = df[price_column(df)]
+def backtest(df: pd.DataFrame, strategy: str, params: dict,
+             vol_target: float, long_only: bool, atr_stop: float, tp_mult: float):
+    price = df[price_col(df)]
     rets = price.pct_change().fillna(0.0)
 
     if strategy == "SMA Crossover":
@@ -393,35 +377,51 @@ def backtest(
     else:
         sig = rsi_signals(price, params["rsi_lb"], params["rsi_buy"], params["rsi_sell"])
 
-    if long_only:
-        sig = sig.clip(lower=0.0)
+    if long_only: sig = sig.clip(lower=0.0)
 
     pos = position_sizer(sig, rets, vol_target)
     atr = compute_atr(df, lb=14)
-    pnl = apply_stops(df, pos, atr, atr_stop, take_profit)
+    pnl = apply_stops(df, pos, atr, atr_stop, tp_mult)
     equity = (1 + pnl).cumprod()
 
     stats = {
         "CAGR": round(annualized_return(pnl), 4),
         "Sharpe": round(sharpe(pnl), 2),
         "MaxDD": round(max_drawdown(equity)[0], 4),
-        "Exposure": round(float((pnl != 0).sum()) / len(pnl) if len(pnl) > 0 else 0.0, 3),
+        "Exposure": round(float((pnl != 0).sum()) / max(len(pnl), 1), 3),
         "LastEquity": round(float(equity.iloc[-1]) if not equity.empty else 1.0, 4),
     }
     return equity, stats
 
-
 # =========================
 # UI
 # =========================
-st.title("📈 Srini’s Algo Backtester")
-st.caption("NSE bhavcopy for *.NS with auto end-date snap → Yahoo → Stooq. SMA/RSI with vol targeting & ATR stops.")
+st.title("📈 Srini Backtester (All-in-one)")
+st.caption("NSE monthly bhavcopy for *.NS (optional prefetch) + yfinance → Stooq for others. "
+           "SMA/RSI with vol targeting & ATR stops.")
 
 with st.sidebar:
-    st.header("Settings")
-    tickers = st.text_input("Tickers", value="TATASTEEL.NS, RELIANCE.NS")
-    start = st.date_input("Start date", value=pd.to_datetime("2018-01-01")).strftime("%Y-%m-%d")
-    end = st.date_input("End date", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
+    st.header("Step 1 — (Optional) Prefetch NSE monthly files")
+    start_pref = st.date_input("Prefetch start", value=pd.to_datetime("2018-01-01")).strftime("%Y-%m-%d")
+    end_pref   = st.date_input("Prefetch end", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
+    debug_http = st.checkbox("Show NSE HTTP statuses (verbose)", value=False)
+    if st.button("Fetch NSE files now"):
+        with st.spinner("Fetching NSE monthly files…"):
+            sdt = _to_ts(start_pref).normalize()
+            edt = _to_ts(end_pref).normalize()
+            store = concat_months_cached(sdt, edt, debug_http=debug_http)
+            st.session_state.nse_store = store
+            st.session_state.nse_ready = not store.empty
+        if st.session_state.nse_ready:
+            st.success("✅ NSE store ready")
+        else:
+            st.warning("No NSE monthly files fetched for this range.")
+
+    st.divider()
+    st.header("Step 2 — Backtest settings")
+    tickers = st.text_input("Tickers", value="RELIANCE.NS, TATASTEEL.NS, AAPL, SPY")
+    start = st.date_input("Backtest start", value=pd.to_datetime("2018-01-01")).strftime("%Y-%m-%d")
+    end   = st.date_input("Backtest end", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
 
     strategy = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion"])
     c1, c2 = st.columns(2)
@@ -435,46 +435,40 @@ with st.sidebar:
         rsi_sell = st.number_input("RSI Sell >", min_value=50, max_value=95, value=70, step=1)
         params = {"rsi_lb": int(rsi_lb), "rsi_buy": int(rsi_buy), "rsi_sell": int(rsi_sell)}
 
-    long_only = st.checkbox("Long-only", value=True)
+    long_only  = st.checkbox("Long-only", value=True)
     vol_target = st.slider("Vol target (annualized)", 0.05, 0.40, 0.12, 0.01)
-    atr_stop = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5)
-    take_profit = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5)
+    atr_stop   = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5)
+    tp_mult    = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5)
+    run_btn    = st.button("Run Backtest")
 
-    run_btn = st.button("Run Backtest")
-
-with st.expander("🔧 Diagnostics"):
-    st.write("yfinance version:", getattr(yf, "__version__", "unknown"))
-    debug_http = st.checkbox("Show NSE HTTP statuses (verbose)", value=False)
-    st.caption("NSE fetch uses daily bhavcopy ZIPs; end date auto-snaps to last available trading day.")
-    if st.button("Clear data cache"):
-        load_prices.clear()
-        fetch_nse_bhavcopy.clear()
-        _nse_bhav_exists.clear()
-        st.success("Cache cleared. Run again.")
-
+with st.expander("🔧 Diagnostics / Cache"):
+    st.write("yfinance:", getattr(yf, "__version__", "unknown"))
+    if st.button("Clear all caches"):
+        fetch_month_df.clear(); concat_months_cached.clear()
+        load_prices_from_store.clear(); load_prices_live.clear()
+        st.success("Caches cleared.")
 
 # =========================
 # Run
 # =========================
 if run_btn:
-    data = load_prices(tickers, start, end, debug_http=debug_http)
+    data = load_prices_all(tickers, start, end)
 
     if not data:
-        st.error("No data downloaded (NSE/Yahoo/Stooq). Try a different range or ticker.")
+        st.error("No data downloaded. Try a different range/tickers. For *.NS, prefetch NSE files in Step 1 for best results.")
         st.stop()
 
-    st.caption("Loaded data for → " + ", ".join(sorted(data.keys())))
-
+    st.caption("Loaded → " + ", ".join(sorted(data.keys())))
     results = []
     tabs = st.tabs(list(data.keys()))
     for tab, t in zip(tabs, data.keys()):
         with tab:
             df = data[t]
             if df is None or df.empty:
-                st.warning(f"No data for {t}")
-                continue
-            equity, stats = backtest(df, strategy, params, vol_target, long_only, atr_stop, take_profit)
-            st.subheader(f"{t} – Equity Curve")
+                st.warning(f"No data for {t}"); continue
+            st.write(f"{t}: {len(df)} rows between {df.index.min().date()} and {df.index.max().date()}")
+            equity, stats = backtest(df, strategy, params, vol_target, long_only, atr_stop, tp_mult)
+            st.subheader(f"{t} — Equity Curve")
             st.line_chart(equity, height=320)
             st.write("**Stats**:", stats)
             results.append({"Ticker": t, **stats})
@@ -483,10 +477,6 @@ if run_btn:
         res_df = pd.DataFrame(results)
         st.subheader("📋 Summary")
         st.dataframe(res_df, use_container_width=True)
-        st.download_button(
-            "Download Results CSV",
-            res_df.to_csv(index=False).encode(),
-            file_name="results_summary.csv",
-        )
+        st.download_button("Download Results CSV", res_df.to_csv(index=False).encode(), "results_summary.csv")
 else:
-    st.info("Choose tickers & dates, then click **Run Backtest**. For *.NS, the End date snaps to the latest bhavcopy.")
+    st.info("Optionally prefetch NSE monthly files (Step 1), then set tickers & dates and click **Run Backtest**.")
