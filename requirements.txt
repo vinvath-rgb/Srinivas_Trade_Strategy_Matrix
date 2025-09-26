@@ -1,3 +1,4 @@
+pandas-datareader==0.10.0
 streamlit==1.38.0
 yfinance==0.2.43
 pandas==2.2.2
