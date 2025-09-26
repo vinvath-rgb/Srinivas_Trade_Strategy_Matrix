@@ -3,3 +3,4 @@ streamlit==1.38.0
 yfinance==0.2.43
 pandas==2.2.2
 numpy==1.26.4
+alpha_vantage==2.3.1
