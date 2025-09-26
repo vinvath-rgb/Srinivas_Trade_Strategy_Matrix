@@ -255,7 +255,7 @@ for sym in candidates:
         st.warning("Alpha Vantage key not set; skipping AV fallback.")
 
     if not results:
-        return {}
+    return {}
 
     # Align calendars (intersection)
     common_idx = sorted(set.intersection(*[set(df.index) for df in results.values()]))
