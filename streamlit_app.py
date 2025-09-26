@@ -3,119 +3,19 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 import time
+from pandas_datareader import data as pdr
 
 st.set_page_config(page_title="Srini Algo Backtester", layout="wide")
 
 # =========================
-# Utilities & Diagnostics
+# Helpers & Indicators
 # =========================
 def price_column(df: pd.DataFrame) -> str:
-    """Return the preferred price column present in DataFrame."""
     return "Adj Close" if "Adj Close" in df.columns else "Close"
 
 def _to_ts(d):
-    """Accept 'YYYY-MM-DD' or 'YYYY/MM/DD' or date objects; return tz-naive Timestamp."""
     return pd.to_datetime(d).tz_localize(None)
 
-def diag_fetch(ticker="AAPL"):
-    """Quick test to verify that yfinance returns data in this environment."""
-    try:
-        df = yf.download(
-            ticker,
-            start="2023-01-01",
-            end=pd.Timestamp.today().strftime("%Y-%m-%d"),
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-            proxy=None
-        )
-        return df.head(), df.shape
-    except Exception as e:
-        return f"Error: {e}", None
-
-# =========================
-# Robust Yahoo Loader
-# =========================
-@st.cache_data(show_spinner=False)
-def load_prices(tickers_raw: str, start, end):
-    """
-    Downloads daily OHLCV from Yahoo for comma-separated tickers.
-    - Includes the typed end date (yfinance 'end' is exclusive).
-    - Tries batch download first, then per-ticker with retries/backoff.
-    - Returns dict: {ticker: DataFrame} with aligned index across tickers.
-    """
-    tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
-    if not tickers:
-        return {}
-
-    start = _to_ts(start)
-    end   = _to_ts(end)
-    end_inclusive = end + pd.Timedelta(days=1)  # include end day
-
-    results = {}
-
-    # Fast path: batch download (fewer HTTP calls)
-    try:
-        df = yf.download(
-            tickers=tickers,
-            start=start,
-            end=end_inclusive,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            group_by="ticker",
-            threads=False,  # safer on some hosts
-            timeout=60,
-            proxy=None
-        )
-        if isinstance(df.columns, pd.MultiIndex):  # multiple tickers → multiindex columns
-            for t in tickers:
-                if t in df.columns.get_level_values(0):
-                    sub = df[t].dropna(how="all").copy()
-                    if not sub.empty:
-                        results[t] = sub
-        else:
-            # Single ticker case → normal frame
-            if not df.empty and len(tickers) == 1:
-                results[tickers[0]] = df.dropna(how="all").copy()
-    except Exception:
-        pass  # fall back to per-ticker
-
-    # Fallback: per-ticker with retries/backoff
-    missing = [t for t in tickers if t not in results]
-    for t in missing:
-        for attempt in range(1, 4):
-            try:
-                dft = yf.download(
-                    t,
-                    start=start,
-                    end=end_inclusive,
-                    interval="1d",
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False
-                ).dropna(how="all")
-                if not dft.empty:
-                    results[t] = dft
-                    break
-            except Exception:
-                pass
-            time.sleep(1.5 * attempt)  # simple backoff
-
-    if not results:
-        return {}
-
-    # Align on common calendar (intersection of dates)
-    common_idx = sorted(set.intersection(*[set(df.index) for df in results.values()]))
-    if not common_idx:
-        return {}
-    results = {t: df.loc[common_idx].copy() for t, df in results.items() if not df.empty}
-    return results
-
-# =========================
-# Indicators & Helpers
-# =========================
 def rsi(series: pd.Series, lb: int = 14) -> pd.Series:
     delta = series.diff()
     up = delta.clip(lower=0)
@@ -195,15 +95,104 @@ def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> p
     return sig.fillna(0.0)
 
 # =========================
-# Backtest Driver (per ticker)
+# Yahoo + Stooq loader
 # =========================
-def backtest(df: pd.DataFrame, strategy: str, params: dict, vol_target: float, long_only: bool, atr_stop: float, take_profit: float):
+@st.cache_data(show_spinner=False)
+def load_prices(tickers_raw: str, start, end):
+    """
+    Download OHLCV data.
+      • Tries Yahoo Finance first (with retries, proxy=None, timeout=60)
+      • Falls back to Stooq if Yahoo gives no data
+      • Returns {ticker: DataFrame} aligned on common dates
+    """
+    tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
+    if not tickers:
+        return {}
+
+    start = _to_ts(start)
+    end   = _to_ts(end)
+    end_inclusive = end + pd.Timedelta(days=1)
+
+    results = {}
+
+    # --- 1. Yahoo batch ---
+    try:
+        df = yf.download(
+            tickers=tickers,
+            start=start,
+            end=end_inclusive,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            group_by="ticker",
+            threads=False,
+            timeout=60,
+            proxy=None
+        )
+        if isinstance(df.columns, pd.MultiIndex):
+            lvl0 = df.columns.get_level_values(0)
+            for t in tickers:
+                if t in lvl0:
+                    sub = df[t].dropna(how="all").copy()
+                    if not sub.empty: results[t] = sub
+        else:
+            if not df.empty and len(tickers) == 1:
+                results[tickers[0]] = df.dropna(how="all").copy()
+    except Exception:
+        pass
+
+    # --- 2. Yahoo per-ticker retries ---
+    missing = [t for t in tickers if t not in results]
+    for t in missing:
+        for attempt in range(1, 4):
+            try:
+                dft = yf.download(
+                    t, start=start, end=end_inclusive,
+                    interval="1d", auto_adjust=False, progress=False,
+                    threads=False, timeout=60, proxy=None
+                ).dropna(how="all")
+                if not dft.empty:
+                    results[t] = dft
+                    break
+            except Exception:
+                pass
+            time.sleep(1.5 * attempt)
+
+    # --- 3. Fallback to Stooq ---
+    still_missing = [t for t in tickers if t not in results]
+    if still_missing:
+        st.info(f"Yahoo empty for: {', '.join(still_missing)} → trying Stooq.")
+        for t in still_missing:
+            try:
+                dft = pdr.DataReader(t, "stooq", start=start, end=end_inclusive)
+                if dft is not None and not dft.empty:
+                    dft = dft.sort_index()  # Stooq returns newest-first
+                    if "Adj Close" not in dft.columns and "Close" in dft.columns:
+                        dft["Adj Close"] = dft["Close"]
+                    dft = dft[["Open", "High", "Low", "Close", "Adj Close", "Volume"]].dropna(how="all")
+                    if not dft.empty: results[t] = dft
+            except Exception:
+                st.warning(f"Stooq also failed for {t}")
+
+    if not results:
+        return {}
+
+    common_idx = sorted(set.intersection(*[set(df.index) for df in results.values()]))
+    if not common_idx:
+        return {}
+    results = {t: df.loc[common_idx].copy() for t, df in results.items() if not df.empty}
+    return results
+
+# =========================
+# Backtest driver
+# =========================
+def backtest(df: pd.DataFrame, strategy: str, params: dict,
+             vol_target: float, long_only: bool,
+             atr_stop: float, take_profit: float):
     price = df[price_column(df)]
     rets = price.pct_change().fillna(0.0)
-    if strategy == "SMA Crossover":
-        sig = sma_signals(price, params["fast"], params["slow"])
-    else:
-        sig = rsi_signals(price, params["rsi_lb"], params["rsi_buy"], params["rsi_sell"])
+    sig = sma_signals(price, params["fast"], params["slow"]) if strategy == "SMA Crossover" \
+          else rsi_signals(price, params["rsi_lb"], params["rsi_buy"], params["rsi_sell"])
     if long_only:
         sig = sig.clip(lower=0.0)
     pos = position_sizer(sig, rets, vol_target)
@@ -222,74 +211,59 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict, vol_target: float, l
 # =========================
 # UI
 # =========================
-st.title("📈 Srini’s Algo Backtester")
-st.caption("SMA crossover & RSI mean-reversion with vol targeting + ATR stops. Educational use only.")
+st.title("📈 Srini’s Algo Backtester (Yahoo + Stooq fallback)")
+st.caption("SMA crossover & RSI mean-reversion with vol targeting + ATR stops.")
 
 with st.sidebar:
     st.header("Settings")
     tickers = st.text_input("Tickers (comma-separated)", value="AAPL,MSFT")
     start = st.date_input("Start date", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
     end = st.date_input("End date", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
-
     strategy = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion"])
     col1, col2 = st.columns(2)
     if strategy == "SMA Crossover":
-        fast = col1.number_input("Fast SMA", min_value=2, max_value=200, value=20, step=1)
-        slow = col2.number_input("Slow SMA", min_value=5, max_value=400, value=100, step=5)
+        fast = col1.number_input("Fast SMA", min_value=2, max_value=200, value=20)
+        slow = col2.number_input("Slow SMA", min_value=5, max_value=400, value=100)
         params = {"fast": int(fast), "slow": int(slow)}
     else:
-        rsi_lb = col1.number_input("RSI lookback", min_value=2, max_value=100, value=14, step=1)
-        rsi_buy = col2.number_input("RSI Buy <", min_value=5, max_value=50, value=30, step=1)
-        rsi_sell = st.number_input("RSI Sell >", min_value=50, max_value=95, value=70, step=1)
+        rsi_lb = col1.number_input("RSI lookback", min_value=2, max_value=100, value=14)
+        rsi_buy = col2.number_input("RSI Buy <", min_value=5, max_value=50, value=30)
+        rsi_sell = st.number_input("RSI Sell >", min_value=50, max_value=95, value=70)
         params = {"rsi_lb": int(rsi_lb), "rsi_buy": int(rsi_buy), "rsi_sell": int(rsi_sell)}
-
     long_only = st.checkbox("Long-only", value=False)
     vol_target = st.slider("Vol target (annualized)", 0.05, 0.40, 0.15, 0.01)
     atr_stop = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5)
     take_profit = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5)
-
     run_btn = st.button("Run Backtest")
 
-# Diagnostics panel
 with st.expander("🔧 Diagnostics"):
     st.write("yfinance version:", getattr(yf, "__version__", "unknown"))
-    head, shape = diag_fetch("AAPL")
-    st.write("AAPL test shape:", shape)
-    st.write(head)
 
 # =========================
 # Run
 # =========================
 if run_btn:
     data = load_prices(tickers, start, end)
-
     if not data:
-        st.error("No data downloaded. Try simple US tickers (AAPL,MSFT) and ensure End ≤ today.")
+        st.error("No data downloaded from Yahoo or Stooq. Check tickers and dates.")
         st.stop()
-    else:
-        st.caption("Tickers with data: " + ", ".join(sorted(data.keys())))
 
+    st.caption("Data sources loaded for: " + ", ".join(data.keys()))
     results = []
     tabs = st.tabs(list(data.keys()))
     for tab, t in zip(tabs, data.keys()):
-        df = data[t]
         with tab:
-            if df is None or df.empty:
-                st.warning(f"No data for {t}"); continue
+            df = data[t]
             equity, stats = backtest(df, strategy, params, vol_target, long_only, atr_stop, take_profit)
             st.subheader(f"{t} – Equity Curve")
-            st.line_chart(equity, height=300)
+            st.line_chart(equity)
             st.write("**Stats**:", stats)
 
-    # Combined summary
-    for t, df in data.items():
-        if df is None or df.empty: continue
-        eq, stx = backtest(df, strategy, params, vol_target, long_only, atr_stop, take_profit)
-        results.append({"Ticker": t, **stx})
-    if results:
-        res_df = pd.DataFrame(results)
-        st.subheader("📋 Summary (last run)")
-        st.dataframe(res_df, use_container_width=True)
-        st.download_button("Download Results CSV", res_df.to_csv(index=False).encode(), file_name="results_summary.csv")
+    res_df = pd.DataFrame([{"Ticker": t, **backtest(data[t], strategy, params,
+                      vol_target, long_only, atr_stop, take_profit)[1]} for t in data])
+    st.subheader("📋 Summary")
+    st.dataframe(res_df, use_container_width=True)
+    st.download_button("Download Results CSV", res_df.to_csv(index=False).encode(),
+                       file_name="results_summary.csv")
 else:
-    st.info("Set your tickers & parameters in the sidebar, then click **Run Backtest**.")
+    st.info("Set tickers & parameters, then click **Run Backtest**.")
