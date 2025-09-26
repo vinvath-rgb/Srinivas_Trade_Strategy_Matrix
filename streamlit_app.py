@@ -227,11 +227,18 @@ def load_prices(tickers_raw: str, start, end):
             for i, t in enumerate(final_missing):
                 base = t.split(".")[0]
                 candidates = [t]  # raw (in case user typed NSE:XXX directly)
-                if t.endswith(".NS"):
-                    candidates.append(f"NSE:{base}")   # e.g., ADANIPORTS.NS -> NSE:ADANIPORTS
-                if t.endswith(".BO"):
-                    candidates.append(f"BSE:{base}")   # e.g., 532921.BO -> BSE:532921
-
+                #if t.endswith(".NS"):
+                    #candidates.append(f"NSE:{base}")   # e.g., ADANIPORTS.NS -> NSE:ADANIPORTS
+                #if t.endswith(".BO"):
+                    #candidates.append(f"BSE:{base}")   # e.g., 532921.BO -> BSE:532921
+if t.endswith(".NS"):
+    base = t.split(".")[0]
+    candidates.append(f"NSE:{base}")
+elif t.endswith(".BO"):
+    base = t.split(".")[0]
+    candidates.append(f"BSE:{base}")
+else:
+    candidates.append(f"NSE:{t}")  # allow plain NSE:SYMBOL too
                 got = False
                 for sym in candidates:
                     dft = av_fetch_one(sym, start, end_inclusive)
@@ -298,7 +305,7 @@ with st.sidebar:
     st.header("Settings")
 
     # ---- Hard-coded tickers for your single test ----
-    tickers = "TATASTEEL.NS, RELIANCE.NS"
+    tickers = "TATASTEEL, RELIANCE"
     st.text_input("Tickers (hard-coded for test)", value=tickers, disabled=True)
 
     start = st.date_input("Start date", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
