@@ -1,7 +1,8 @@
-# Srini Algo Backtester — NSE bhavcopy + Yahoo -> Stooq
-# -----------------------------------------------------
-# Works well on Render: for NSE .NS tickers fetches official bhavcopy (EOD only),
-# then falls back to Yahoo and Stooq. Global tickers use Yahoo -> Stooq.
+# Srini Algo Backtester — NSE bhavcopy + Yahoo -> Stooq with auto end-date snap
+# -----------------------------------------------------------------------------
+# For *.NS tickers: official NSE bhavcopy (EOD) with robust headers & dual-host fallback,
+# then Yahoo, then Stooq. For global tickers: Yahoo -> Stooq.
+# Auto-snaps "End date" to latest available trading day if user selects today/holiday.
 
 import os
 import io
@@ -18,7 +19,7 @@ st.set_page_config(page_title="Srini Algo Backtester", layout="wide")
 
 
 # =========================
-# Utilities & Indicators
+# Helpers
 # =========================
 def price_column(df: pd.DataFrame) -> str:
     return "Adj Close" if "Adj Close" in df.columns else "Close"
@@ -83,9 +84,7 @@ def position_sizer(signal: pd.Series, returns: pd.Series, vol_target: float, ppy
 
 
 def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series, atr_stop_mult: float, tp_mult: float) -> pd.Series:
-    """
-    Simple stop/TP simulator on close-to-close returns (no intraday path dependency).
-    """
+    """Close-to-close stop/TP simulation (simple & fast)."""
     close = df[price_column(df)]
     ret = close.pct_change().fillna(0.0)
     pnl = pd.Series(0.0, index=close.index)
@@ -149,17 +148,16 @@ def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> p
 
 
 # =========================
-# NSE bhavcopy fetcher (official)
+# NSE bhavcopy fetcher (robust)
 # =========================
-# Use one shared session (headers + cookies) so NSE won't 403 us.
 _session = requests.Session()
 _session.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
     "Connection": "keep-alive",
+    "Referer": "https://www.nseindia.com/",
 })
-
 
 def _nse_prime_cookies():
     try:
@@ -167,21 +165,48 @@ def _nse_prime_cookies():
     except Exception:
         pass
 
-
-def _bhav_url_for(date: pd.Timestamp) -> str:
+def _bhav_urls_for(date: pd.Timestamp) -> list[str]:
     y   = date.strftime("%Y")
     mon = date.strftime("%b").upper()      # JAN
     dmy = date.strftime("%d%b%Y").upper()  # 01JAN2024
-    # Official archive host
-    return f"https://archives.nseindia.com/content/historical/EQUITIES/{y}/{mon}/cm{dmy}bhav.csv.zip"
-
+    # Try both hosts; NSE flips between them
+    return [
+        f"https://archives.nseindia.com/content/historical/EQUITIES/{y}/{mon}/cm{dmy}bhav.csv.zip",
+        f"https://www1.nseindia.com/content/historical/EQUITIES/{y}/{mon}/cm{dmy}bhav.csv.zip",
+    ]
 
 @st.cache_data(show_spinner=False)
-def fetch_nse_bhavcopy(symbol_no_suffix: str, start: str, end: str, polite_sleep: float = 0.6) -> pd.DataFrame:
+def _nse_bhav_exists(date: pd.Timestamp) -> bool:
+    """Check if any host has a bhavcopy for this date (HEAD/GET)."""
+    _nse_prime_cookies()
+    for url in _bhav_urls_for(date):
+        try:
+            r = _session.head(url, timeout=8, allow_redirects=True)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+    return False
+
+def snap_to_latest_available(end_dt: pd.Timestamp, max_lookback_days: int = 10) -> pd.Timestamp:
     """
-    Download official NSE daily 'bhavcopy' ZIPs and extract rows for a single symbol.
-    symbol_no_suffix: 'RELIANCE', 'TATASTEEL' (no .NS)
-    Returns DataFrame with index=DATE and columns: Open, High, Low, Close, Adj Close, Volume
+    If end_dt doesn't have a bhavcopy yet (today/holiday), walk back until we find one.
+    Caps at ~2 weeks to avoid long loops.
+    """
+    end_dt = end_dt.normalize()
+    for _ in range(max_lookback_days):
+        if _nse_bhav_exists(end_dt):
+            return end_dt
+        end_dt -= pd.Timedelta(days=1)
+    return end_dt  # may still be unavailable; loader will handle
+
+@st.cache_data(show_spinner=False)
+def fetch_nse_bhavcopy(symbol_no_suffix: str, start: str, end: str,
+                       sleep_sec: float = 0.5, max_retries: int = 2,
+                       debug_http: bool = False) -> pd.DataFrame:
+    """
+    Download official NSE daily 'bhavcopy' ZIPs and extract rows for a single symbol (e.g., 'RELIANCE', 'TATASTEEL').
+    Returns DataFrame index=DATE with columns: Open, High, Low, Close, Adj Close, Volume
     """
     sym = symbol_no_suffix.upper().strip()
     start_dt = pd.to_datetime(start).normalize()
@@ -191,33 +216,49 @@ def fetch_nse_bhavcopy(symbol_no_suffix: str, start: str, end: str, polite_sleep
 
     _nse_prime_cookies()
 
-    # Only request business days to avoid obvious 404s
+    # Business days range (still includes Indian holidays but skips weekends).
     days = pd.bdate_range(start_dt, end_dt, freq="C")
 
     frames = []
     for d in days:
-        url = _bhav_url_for(d)
-        try:
-            r = _session.get(url, timeout=12)
-            if r.status_code == 200:
-                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-                    with z.open(z.namelist()[0]) as f:
-                        df = pd.read_csv(f)
-                m = df["SYMBOL"].astype(str).str.upper() == sym
-                if m.any():
-                    df = df.loc[m, ["TIMESTAMP","OPEN","HIGH","LOW","CLOSE","TOTTRDQTY"]].copy()
-                    df.rename(columns={
-                        "TIMESTAMP":"DATE",
-                        "OPEN":"Open","HIGH":"High","LOW":"Low","CLOSE":"Close",
-                        "TOTTRDQTY":"Volume"
-                    }, inplace=True)
-                    df["DATE"] = pd.to_datetime(df["DATE"])
-                    df["Adj Close"] = df["Close"]  # NSE has no adjusted close in bhavcopy
-                    df = df.sort_values("DATE")
-                    frames.append(df)
-        except Exception:
-            pass
-        time.sleep(polite_sleep)  # be polite to avoid rate-limits
+        urls = _bhav_urls_for(d)
+        got_day = False
+        for url in urls:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    r = _session.get(url, timeout=15)
+                    status = r.status_code
+                    if debug_http:
+                        st.write(f"NSE GET {url} -> {status}")
+                    if status == 200:
+                        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                            with z.open(z.namelist()[0]) as f:
+                                df = pd.read_csv(f)
+                        m = df["SYMBOL"].astype(str).str.upper() == sym
+                        if m.any():
+                            df = df.loc[m, ["TIMESTAMP","OPEN","HIGH","LOW","CLOSE","TOTTRDQTY"]].copy()
+                            df.rename(columns={
+                                "TIMESTAMP":"DATE",
+                                "OPEN":"Open","HIGH":"High","LOW":"Low","CLOSE":"Close",
+                                "TOTTRDQTY":"Volume"
+                            }, inplace=True)
+                            df["DATE"] = pd.to_datetime(df["DATE"])
+                            df["Adj Close"] = df["Close"]
+                            df = df.sort_values("DATE")
+                            frames.append(df)
+                        got_day = True
+                        break
+                    elif status in (403, 429):
+                        time.sleep(1.0 * attempt)
+                        continue
+                    else:
+                        break
+                except Exception:
+                    time.sleep(0.8 * attempt)
+                    continue
+            if got_day:
+                break
+        time.sleep(sleep_sec)
 
     if not frames:
         return pd.DataFrame()
@@ -230,13 +271,13 @@ def fetch_nse_bhavcopy(symbol_no_suffix: str, start: str, end: str, polite_sleep
 
 
 # =========================
-# Data loader (NSE -> Yahoo -> Stooq)
+# Data loader (NSE -> Yahoo -> Stooq) with auto-snap
 # =========================
 @st.cache_data(show_spinner=False)
-def load_prices(tickers_raw: str, start, end):
+def load_prices(tickers_raw: str, start, end, debug_http: bool = False):
     """
-    For *.NS: First try NSE official bhavcopy (free), else fall back to Yahoo/Stooq.
-    For others: Yahoo, then Stooq.
+    For *.NS: First snap 'end' to latest available bhavcopy date, then try NSE official.
+    Fallbacks: Yahoo, then Stooq. Others: Yahoo -> Stooq.
     Returns: {ticker: DataFrame} aligned on common dates.
     """
     tickers = [t.strip() for t in tickers_raw.split(",") if t.strip()]
@@ -244,15 +285,20 @@ def load_prices(tickers_raw: str, start, end):
         return {}
 
     start = _to_ts(start)
-    end = _to_ts(end)
-    end_inclusive = end + pd.Timedelta(days=1)
+    end   = _to_ts(end)
+
+    # Auto-snap end to latest available NSE bhavcopy if any .NS is requested
+    has_ns = any(t.upper().endswith(".NS") or (".NS" not in t.upper() and t.isalpha()) for t in tickers)
+    snapped_end = snap_to_latest_available(end) if has_ns else end
+    end_inclusive = snapped_end + pd.Timedelta(days=1)
 
     results: dict[str, pd.DataFrame] = {}
 
     # 1) NSE official for .NS
     for t in [x for x in tickers if x.upper().endswith(".NS")]:
         base = t.split(".")[0].upper()
-        dfn = fetch_nse_bhavcopy(base, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        dfn = fetch_nse_bhavcopy(base, start.strftime("%Y-%m-%d"), snapped_end.strftime("%Y-%m-%d"),
+                                 debug_http=debug_http)
         if not dfn.empty:
             results[t.upper()] = dfn
 
@@ -369,14 +415,13 @@ def backtest(
 # UI
 # =========================
 st.title("📈 Srini’s Algo Backtester")
-st.caption("NSE official bhavcopy for *.NS + Yahoo → Stooq for others. SMA/RSI with vol targeting & ATR stops.")
+st.caption("NSE bhavcopy for *.NS with auto end-date snap → Yahoo → Stooq. SMA/RSI with vol targeting & ATR stops.")
 
 with st.sidebar:
     st.header("Settings")
     tickers = st.text_input("Tickers", value="TATASTEEL.NS, RELIANCE.NS")
     start = st.date_input("Start date", value=pd.to_datetime("2018-01-01")).strftime("%Y-%m-%d")
-    end = st.date_input("End date", value=(pd.Timestamp.today() - pd.Timedelta(days=1))).strftime("%Y-%m-%d")
-    # ^ NSE bhavcopy is EOD — use yesterday or earlier for reliable results.
+    end = st.date_input("End date", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
 
     strategy = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion"])
     c1, c2 = st.columns(2)
@@ -399,10 +444,12 @@ with st.sidebar:
 
 with st.expander("🔧 Diagnostics"):
     st.write("yfinance version:", getattr(yf, "__version__", "unknown"))
-    st.write("NSE: downloading daily bhavcopy ZIPs (EOD only).")
+    debug_http = st.checkbox("Show NSE HTTP statuses (verbose)", value=False)
+    st.caption("NSE fetch uses daily bhavcopy ZIPs; end date auto-snaps to last available trading day.")
     if st.button("Clear data cache"):
         load_prices.clear()
         fetch_nse_bhavcopy.clear()
+        _nse_bhav_exists.clear()
         st.success("Cache cleared. Run again.")
 
 
@@ -410,10 +457,10 @@ with st.expander("🔧 Diagnostics"):
 # Run
 # =========================
 if run_btn:
-    data = load_prices(tickers, start, end)
+    data = load_prices(tickers, start, end, debug_http=debug_http)
 
     if not data:
-        st.error("No data downloaded (NSE/Yahoo/Stooq). Try ending on yesterday, and check ticker symbols.")
+        st.error("No data downloaded (NSE/Yahoo/Stooq). Try a different range or ticker.")
         st.stop()
 
     st.caption("Loaded data for → " + ", ".join(sorted(data.keys())))
@@ -442,4 +489,4 @@ if run_btn:
             file_name="results_summary.csv",
         )
 else:
-    st.info("Pick tickers & dates (end ≤ yesterday for NSE data), then click **Run Backtest**.")
+    st.info("Choose tickers & dates, then click **Run Backtest**. For *.NS, the End date snaps to the latest bhavcopy.")
