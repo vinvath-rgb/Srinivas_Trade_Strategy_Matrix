@@ -1,14 +1,16 @@
-# Srini Algo Backtester — Yahoo -> Stooq -> Alpha Vantage fallback
-# ---------------------------------------------------------------
+# Srini Algo Backtester — NSE bhavcopy + Yahoo -> Stooq
+# -----------------------------------------------------
 
 import os
+import io
 import time
+import zipfile
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 from pandas_datareader import data as pdr
-from alpha_vantage.timeseries import TimeSeries
 
 st.set_page_config(page_title="Srini Algo Backtester", layout="wide")
 
@@ -17,12 +19,10 @@ st.set_page_config(page_title="Srini Algo Backtester", layout="wide")
 # Utilities & Indicators
 # =========================
 def price_column(df: pd.DataFrame) -> str:
-    """Prefer 'Adj Close' if present, else 'Close'."""
     return "Adj Close" if "Adj Close" in df.columns else "Close"
 
 
 def _to_ts(d):
-    """tz-naive pandas Timestamp from date or string."""
     return pd.to_datetime(d).tz_localize(None)
 
 
@@ -81,14 +81,9 @@ def position_sizer(signal: pd.Series, returns: pd.Series, vol_target: float, ppy
 
 
 def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series, atr_stop_mult: float, tp_mult: float) -> pd.Series:
-    """
-    Simple stop/TP simulator on close-to-close returns.
-    This is intentionally simple (no intraday) but consistent.
-    """
     close = df[price_column(df)]
     ret = close.pct_change().fillna(0.0)
     pnl = pd.Series(0.0, index=close.index)
-
     current_pos = 0.0
     entry_price = np.nan
 
@@ -97,7 +92,6 @@ def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series, atr_stop_mult:
         c = float(close.iloc[i])
         a = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else np.nan
 
-        # new position or sign flip -> reset entry
         if i == 0 or np.sign(s) != np.sign(current_pos):
             entry_price = c
         current_pos = s
@@ -106,7 +100,6 @@ def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series, atr_stop_mult:
             pnl.iloc[i] = 0.0
             continue
 
-        # ATR-based stop & take-profit (symmetric)
         if current_pos > 0:
             stop_level = entry_price * (1 - atr_stop_mult * a / max(entry_price, 1e-12))
             tp_level = entry_price * (1 + tp_mult * a / max(entry_price, 1e-12))
@@ -151,54 +144,89 @@ def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> p
 
 
 # =========================
-# Alpha Vantage fetcher
+# NSE bhavcopy fetcher (official)
 # =========================
-def av_fetch_one(ticker: str, start, end):
-    """
-    Alpha Vantage daily adjusted (needs env var ALPHAVANTAGE_API_KEY).
-    Accepts:
-      - US tickers: 'AAPL'
-      - NSE: 'NSE:TATASTEEL'
-      - BSE: 'BSE:532921'
-    """
-    api_key = os.environ.get("ALPHAVANTAGE_API_KEY") or st.secrets.get("ALPHAVANTAGE_API_KEY", None)
-    if not api_key:
-        return pd.DataFrame()
-    try:
-        ts = TimeSeries(key=api_key, output_format="pandas")
-        df, _meta = ts.get_daily_adjusted(symbol=ticker, outputsize="full")
-        if df is None or df.empty:
-            return pd.DataFrame()
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+})
 
-        rename_map = {
-            "1. open": "Open",
-            "2. high": "High",
-            "3. low": "Low",
-            "4. close": "Close",
-            "5. adjusted close": "Adj Close",
-            "6. volume": "Volume",
-        }
-        df = df.rename(columns=rename_map)
-        df = df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
-        df.index = pd.to_datetime(df.index)
-        df = df.sort_index()
-        df = df.loc[(df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end))]
-        return df.dropna(how="all")
-    except Exception:
+
+@st.cache_data(show_spinner=False)
+def fetch_nse_bhavcopy(symbol: str, start: str, end: str, polite_sleep: float = 0.7) -> pd.DataFrame:
+    """
+    Download official NSE daily 'bhavcopy' ZIPs and extract rows for a single symbol.
+    symbol: NSE symbol without suffix (e.g., 'RELIANCE', 'TATASTEEL')
+    Returns DataFrame with columns: Date, Open, High, Low, Close, Adj Close, Volume
+    """
+    start_dt = pd.to_datetime(start).normalize()
+    end_dt = pd.to_datetime(end).normalize()
+    if end_dt < start_dt:
         return pd.DataFrame()
 
+    # For very large ranges, this can be many calls; cap to ~12 years to be safe.
+    if (end_dt - start_dt).days > 4500:
+        end_dt = start_dt + pd.Timedelta(days=4500)
+
+    out_frames = []
+    current = start_dt
+
+    while current <= end_dt:
+        y = current.strftime("%Y")
+        mon = current.strftime("%b").upper()           # JAN, FEB, ...
+        dmy = current.strftime("%d%b%Y").upper()       # 01JAN2024
+        url = f"https://www1.nseindia.com/content/historical/EQUITIES/{y}/{mon}/cm{dmy}bhav.csv.zip"
+        try:
+            r = session.get(url, timeout=12)
+            if r.status_code == 200:
+                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                    # The ZIP contains one CSV file, name like cm01JAN2024bhav.csv
+                    with z.open(z.namelist()[0]) as f:
+                        df = pd.read_csv(f)
+                        # Filter for the symbol
+                        df = df[df["SYMBOL"].str.upper() == symbol.upper()]
+                        if not df.empty:
+                            df["DATE"] = pd.to_datetime(df["TIMESTAMP"])
+                            df = df.rename(columns={
+                                "OPEN": "Open", "HIGH": "High", "LOW": "Low",
+                                "CLOSE": "Close", "TOTTRDQTY": "Volume"
+                            })
+                            keep = ["DATE", "Open", "High", "Low", "Close", "Volume"]
+                            df = df[keep].sort_values("DATE")
+                            # NSE bhavcopy has no adjusted close; use Close as Adj Close
+                            df["Adj Close"] = df["Close"]
+                            out_frames.append(df)
+        except Exception:
+            # Ignore that day (holiday / missing file / transient error)
+            pass
+
+        current += pd.Timedelta(days=1)
+        time.sleep(polite_sleep)
+
+    if not out_frames:
+        return pd.DataFrame()
+
+    out = pd.concat(out_frames, ignore_index=True)
+    out = out.drop_duplicates(subset="DATE").sort_values("DATE")
+    out = out.set_index("DATE")
+    # Ensure all price columns are numeric
+    for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.dropna(how="all")
+    return out
+
 
 # =========================
-# Data loader (Yahoo -> Stooq -> Alpha Vantage)
+# Data loader (NSE -> Yahoo -> Stooq)
 # =========================
 @st.cache_data(show_spinner=False)
 def load_prices(tickers_raw: str, start, end):
     """
-    Yahoo first (batch + per-ticker retries, proxy=None, timeout=60),
-    then Stooq, then Alpha Vantage (if key present).
+    For *.NS: First try NSE official bhavcopy (free), else fall back to Yahoo/Stooq.
+    For others: Yahoo, then Stooq.
     Returns: {ticker: DataFrame} aligned on common dates.
     """
-    tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
+    tickers = [t.strip() for t in tickers_raw.split(",") if t.strip()]
     if not tickers:
         return {}
 
@@ -208,58 +236,61 @@ def load_prices(tickers_raw: str, start, end):
 
     results: dict[str, pd.DataFrame] = {}
 
-    # 1) Yahoo batch
-    try:
-        df = yf.download(
-            tickers=tickers,
-            start=start,
-            end=end_inclusive,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            group_by="ticker",
-            threads=False,
-            timeout=60,
-            proxy=None,
-        )
-        if isinstance(df.columns, pd.MultiIndex):
-            lvl0 = df.columns.get_level_values(0)
-            for t in tickers:
-                if t in lvl0:
-                    sub = df[t].dropna(how="all").copy()
-                    if not sub.empty:
-                        results[t] = sub
-        else:
-            if not df.empty and len(tickers) == 1:
-                results[tickers[0]] = df.dropna(how="all").copy()
-    except Exception:
-        pass
+    # 1) NSE official for .NS
+    for t in [x for x in tickers if x.upper().endswith(".NS")]:
+        base = t.split(".")[0].upper()
+        dfn = fetch_nse_bhavcopy(base, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        if not dfn.empty:
+            results[t.upper()] = dfn
 
-    # 2) Yahoo per-ticker retries
-    missing = [t for t in tickers if t not in results]
+    # 2) Yahoo batch for the rest (and any .NS that NSE failed to fetch)
+    remaining = [t.upper() for t in tickers if t.upper() not in results]
+    if remaining:
+        try:
+            df = yf.download(
+                tickers=remaining,
+                start=start,
+                end=end_inclusive,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                group_by="ticker",
+                threads=False,
+                timeout=60,
+                proxy=None,
+            )
+            if isinstance(df.columns, pd.MultiIndex):
+                lvl0 = df.columns.get_level_values(0)
+                for t in remaining:
+                    if t in lvl0:
+                        sub = df[t].dropna(how="all").copy()
+                        if not sub.empty:
+                            results[t] = sub
+            else:
+                if not df.empty and len(remaining) == 1:
+                    results[remaining[0]] = df.dropna(how="all").copy()
+        except Exception:
+            pass
+
+    # 3) Yahoo per-ticker retries
+    missing = [t for t in remaining if t not in results]
     for t in missing:
-        for attempt in range(1, 4):
+        for attempt in range(1, 3):
             try:
                 dft = yf.download(
-                    t,
-                    start=start,
-                    end=end_inclusive,
-                    interval="1d",
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False,
-                    timeout=60,
-                    proxy=None,
+                    t, start=start, end=end_inclusive, interval="1d",
+                    auto_adjust=False, progress=False, threads=False,
+                    timeout=60, proxy=None
                 ).dropna(how="all")
                 if not dft.empty:
                     results[t] = dft
                     break
             except Exception:
                 pass
-            time.sleep(1.5 * attempt)
+            time.sleep(1.0 * attempt)
 
-    # 3) Stooq fallback
-    still_missing = [t for t in tickers if t not in results]
+    # 4) Stooq fallback
+    still_missing = [t for t in remaining if t not in results]
     for t in still_missing:
         try:
             dft = pdr.DataReader(t, "stooq", start=start, end=end_inclusive)
@@ -267,51 +298,22 @@ def load_prices(tickers_raw: str, start, end):
                 dft = dft.sort_index()
                 if "Adj Close" not in dft.columns and "Close" in dft.columns:
                     dft["Adj Close"] = dft["Close"]
-                dft = dft[["Open", "High", "Low", "Close", "Adj Close", "Volume"]].dropna(how="all")
+                keep = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+                dft = dft[keep].dropna(how="all")
                 if not dft.empty:
                     results[t] = dft
         except Exception:
             pass
 
-    # 4) Alpha Vantage fallback (try symbol variants for NSE/BSE)
-    final_missing = [t for t in tickers if t not in results]
-    if final_missing:
-        has_key = bool(os.environ.get("ALPHAVANTAGE_API_KEY") or st.secrets.get("ALPHAVANTAGE_API_KEY", None))
-        if has_key:
-            st.info(f"Using Alpha Vantage for: {', '.join(final_missing)}")
-            for i, t in enumerate(final_missing):
-                base = t.split(".")[0]
-                candidates = [t]  # raw (in case user passes NSE:XXX directly)
-                if t.endswith(".NS"):
-                    candidates.append(f"NSE:{base}")   # e.g., ADANIPORTS.NS -> NSE:ADANIPORTS
-                elif t.endswith(".BO"):
-                    candidates.append(f"BSE:{base}")   # e.g., 532921.BO -> BSE:532921
-                else:
-                    # Also try assuming NSE if user typed plain symbol without suffix/prefix
-                    candidates.append(f"NSE:{t}")
-
-                got = False
-                for sym in candidates:
-                    dft = av_fetch_one(sym, start, end_inclusive)
-                    if not dft.empty:
-                        results[t] = dft
-                        got = True
-                        break
-
-                # Respect AV free rate limit (~5 calls/min)
-                if i < len(final_missing) - 1:
-                    time.sleep(12)
-        else:
-            st.warning("Alpha Vantage key not set; skipping AV fallback.")
-
     if not results:
         return {}
 
-    # Align calendars (intersection of all dates)
+    # Align calendars (intersection)
     common_idx = sorted(set.intersection(*[set(df.index) for df in results.values()]))
     if not common_idx:
         return {}
-    return {t: df.loc[common_idx].copy() for t, df in results.items() if not df.empty}
+    aligned = {t: df.loc[common_idx].copy() for t, df in results.items() if not df.empty}
+    return aligned
 
 
 # =========================
@@ -356,14 +358,11 @@ def backtest(
 # UI
 # =========================
 st.title("📈 Srini’s Algo Backtester")
-st.caption("SMA crossover & RSI mean-reversion with vol targeting + ATR stops. Data: Yahoo → Stooq → Alpha Vantage.")
+st.caption("NSE bhavcopy for *.NS + Yahoo → Stooq for others. SMA/RSI strategies with vol targeting & ATR stops.")
 
 with st.sidebar:
     st.header("Settings")
-
-    # Default to your NSE test; you can edit it in the box
-    tickers = st.text_input("Tickers", value="NSE:TATASTEEL, NSE:RELIANCE")
-
+    tickers = st.text_input("Tickers", value="TATASTEEL.NS, RELIANCE.NS")
     start = st.date_input("Start date", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
     end = st.date_input("End date", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
 
@@ -388,10 +387,10 @@ with st.sidebar:
 
 with st.expander("🔧 Diagnostics"):
     st.write("yfinance version:", getattr(yf, "__version__", "unknown"))
-    has_av = bool(os.environ.get("ALPHAVANTAGE_API_KEY") or st.secrets.get("ALPHAVANTAGE_API_KEY", None))
-    st.write("Alpha Vantage key detected:", has_av)
+    st.write("NSE fetch uses official daily bhavcopy ZIPs.")
     if st.button("Clear data cache"):
         load_prices.clear()
+        fetch_nse_bhavcopy.clear()
         st.success("Cache cleared. Run again.")
 
 
@@ -402,7 +401,7 @@ if run_btn:
     data = load_prices(tickers, start, end)
 
     if not data:
-        st.error("No data downloaded from Yahoo, Stooq, or Alpha Vantage. Check tickers, dates, or API rate limits.")
+        st.error("No data downloaded (NSE/Yahoo/Stooq). Check tickers, dates, or network.")
         st.stop()
 
     st.caption("Loaded data for → " + ", ".join(sorted(data.keys())))
