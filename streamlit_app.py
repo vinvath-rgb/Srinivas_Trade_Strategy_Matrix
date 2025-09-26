@@ -1,7 +1,8 @@
 # Srini Algo Backtester — Yahoo -> Stooq -> Alpha Vantage fallback
 # ---------------------------------------------------------------
 
-import os, time
+import os
+import time
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -19,9 +20,11 @@ def price_column(df: pd.DataFrame) -> str:
     """Prefer 'Adj Close' if present, else 'Close'."""
     return "Adj Close" if "Adj Close" in df.columns else "Close"
 
+
 def _to_ts(d):
     """tz-naive pandas Timestamp from date or string."""
     return pd.to_datetime(d).tz_localize(None)
+
 
 def rsi(series: pd.Series, lb: int = 14) -> pd.Series:
     delta = series.diff()
@@ -32,29 +35,43 @@ def rsi(series: pd.Series, lb: int = 14) -> pd.Series:
     rs = roll_up / (roll_down + 1e-12)
     return 100 - (100 / (1 + rs))
 
+
 def compute_atr(df: pd.DataFrame, lb: int = 14) -> pd.Series:
-    high = df['High']; low = df['Low']; close = df[price_column(df)]
+    high = df["High"]
+    low = df["Low"]
+    close = df[price_column(df)]
     prev_close = close.shift(1)
-    tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    tr = pd.concat(
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
     return tr.rolling(lb).mean()
 
+
 def annualized_return(series: pd.Series, ppy: int = 252) -> float:
-    if series.empty: return 0.0
-    total = float((1 + series).prod()); years = len(series)/ppy
-    return total ** (1/years) - 1 if years > 0 else 0.0
+    if series.empty:
+        return 0.0
+    total = float((1 + series).prod())
+    years = len(series) / ppy
+    return total ** (1 / years) - 1 if years > 0 else 0.0
+
 
 def sharpe(series: pd.Series, rf: float = 0.0, ppy: int = 252) -> float:
-    if series.std() == 0 or series.empty: return 0.0
-    excess = series - rf/ppy
+    if series.std() == 0 or series.empty:
+        return 0.0
+    excess = series - rf / ppy
     return float(np.sqrt(ppy) * excess.mean() / (excess.std() + 1e-12))
 
+
 def max_drawdown(equity: pd.Series):
-    if equity.empty: return 0.0, None, None
+    if equity.empty:
+        return 0.0, None, None
     roll_max = equity.cummax()
-    dd = (equity/roll_max) - 1.0
+    dd = (equity / roll_max) - 1.0
     trough = dd.idxmin()
     peak = roll_max.loc[:trough].idxmax()
     return float(dd.min()), peak, trough
+
 
 def position_sizer(signal: pd.Series, returns: pd.Series, vol_target: float, ppy: int = 252) -> pd.Series:
     vol = returns.ewm(span=20, adjust=False).std() * np.sqrt(ppy)
@@ -62,15 +79,22 @@ def position_sizer(signal: pd.Series, returns: pd.Series, vol_target: float, ppy
     leverage = (vol_target / (vol + 1e-12)).clip(upper=5.0).fillna(0.0)
     return signal * leverage
 
+
 def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series, atr_stop_mult: float, tp_mult: float) -> pd.Series:
-    """Simple stop/TP simulator on close-to-close returns."""
+    """
+    Simple stop/TP simulator on close-to-close returns.
+    This is intentionally simple (no intraday) but consistent.
+    """
     close = df[price_column(df)]
     ret = close.pct_change().fillna(0.0)
     pnl = pd.Series(0.0, index=close.index)
+
     current_pos = 0.0
     entry_price = np.nan
+
     for i in range(len(close)):
-        s = float(pos.iloc[i]); c = float(close.iloc[i])
+        s = float(pos.iloc[i])
+        c = float(close.iloc[i])
         a = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else np.nan
 
         # new position or sign flip -> reset entry
@@ -82,21 +106,32 @@ def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series, atr_stop_mult:
             pnl.iloc[i] = 0.0
             continue
 
-        # ATR-based stop & take-profit (symmetric in ATR units)
-        stop_level = entry_price * (1 - atr_stop_mult * a / max(entry_price, 1e-12)) if current_pos > 0 \
-                     else entry_price * (1 + atr_stop_mult * a / max(entry_price, 1e-12))
-        tp_level   = entry_price * (1 + tp_mult     * a / max(entry_price, 1e-12)) if current_pos > 0 \
-                     else entry_price * (1 - tp_mult     * a / max(entry_price, 1e-12))
-
-        if (current_pos > 0 and c <= stop_level) or (current_pos < 0 and c >= stop_level):
-            pnl.iloc[i] = 0.0
-            current_pos = 0.0
-        elif (current_pos > 0 and c >= tp_level) or (current_pos < 0 and c <= tp_level):
-            pnl.iloc[i] = current_pos * (tp_mult * a / max(entry_price, 1e-12))
-            current_pos = 0.0
+        # ATR-based stop & take-profit (symmetric)
+        if current_pos > 0:
+            stop_level = entry_price * (1 - atr_stop_mult * a / max(entry_price, 1e-12))
+            tp_level = entry_price * (1 + tp_mult * a / max(entry_price, 1e-12))
+            if c <= stop_level:
+                pnl.iloc[i] = 0.0
+                current_pos = 0.0
+            elif c >= tp_level:
+                pnl.iloc[i] = current_pos * (tp_mult * a / max(entry_price, 1e-12))
+                current_pos = 0.0
+            else:
+                pnl.iloc[i] = current_pos * ret.iloc[i]
         else:
-            pnl.iloc[i] = current_pos * ret.iloc[i]
+            stop_level = entry_price * (1 + atr_stop_mult * a / max(entry_price, 1e-12))
+            tp_level = entry_price * (1 - tp_mult * a / max(entry_price, 1e-12))
+            if c >= stop_level:
+                pnl.iloc[i] = 0.0
+                current_pos = 0.0
+            elif c <= tp_level:
+                pnl.iloc[i] = current_pos * (-tp_mult * a / max(entry_price, 1e-12))
+                current_pos = 0.0
+            else:
+                pnl.iloc[i] = current_pos * ret.iloc[i]
+
     return pnl
+
 
 def sma_signals(price: pd.Series, fast: int, slow: int) -> pd.Series:
     ma_f = price.rolling(fast).mean()
@@ -105,6 +140,7 @@ def sma_signals(price: pd.Series, fast: int, slow: int) -> pd.Series:
     sig[ma_f > ma_s] = 1.0
     sig[ma_f < ma_s] = -1.0
     return sig.fillna(0.0)
+
 
 def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> pd.Series:
     r = rsi(price, lb=rsi_lb)
@@ -120,7 +156,10 @@ def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> p
 def av_fetch_one(ticker: str, start, end):
     """
     Alpha Vantage daily adjusted (needs env var ALPHAVANTAGE_API_KEY).
-    Accepts US tickers ('AAPL'), NSE ('NSE:ADANIPORTS'), BSE ('BSE:532921').
+    Accepts:
+      - US tickers: 'AAPL'
+      - NSE: 'NSE:TATASTEEL'
+      - BSE: 'BSE:532921'
     """
     api_key = os.environ.get("ALPHAVANTAGE_API_KEY") or st.secrets.get("ALPHAVANTAGE_API_KEY", None)
     if not api_key:
@@ -130,7 +169,7 @@ def av_fetch_one(ticker: str, start, end):
         df, _meta = ts.get_daily_adjusted(symbol=ticker, outputsize="full")
         if df is None or df.empty:
             return pd.DataFrame()
-        # Normalize columns
+
         rename_map = {
             "1. open": "Open",
             "2. high": "High",
@@ -164,23 +203,32 @@ def load_prices(tickers_raw: str, start, end):
         return {}
 
     start = _to_ts(start)
-    end   = _to_ts(end)
+    end = _to_ts(end)
     end_inclusive = end + pd.Timedelta(days=1)
-    results = {}
+
+    results: dict[str, pd.DataFrame] = {}
 
     # 1) Yahoo batch
     try:
         df = yf.download(
-            tickers=tickers, start=start, end=end_inclusive, interval="1d",
-            auto_adjust=False, progress=False, group_by="ticker",
-            threads=False, timeout=60, proxy=None
+            tickers=tickers,
+            start=start,
+            end=end_inclusive,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            group_by="ticker",
+            threads=False,
+            timeout=60,
+            proxy=None,
         )
         if isinstance(df.columns, pd.MultiIndex):
             lvl0 = df.columns.get_level_values(0)
             for t in tickers:
                 if t in lvl0:
                     sub = df[t].dropna(how="all").copy()
-                    if not sub.empty: results[t] = sub
+                    if not sub.empty:
+                        results[t] = sub
         else:
             if not df.empty and len(tickers) == 1:
                 results[tickers[0]] = df.dropna(how="all").copy()
@@ -193,9 +241,15 @@ def load_prices(tickers_raw: str, start, end):
         for attempt in range(1, 4):
             try:
                 dft = yf.download(
-                    t, start=start, end=end_inclusive, interval="1d",
-                    auto_adjust=False, progress=False, threads=False,
-                    timeout=60, proxy=None
+                    t,
+                    start=start,
+                    end=end_inclusive,
+                    interval="1d",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                    timeout=60,
+                    proxy=None,
                 ).dropna(how="all")
                 if not dft.empty:
                     results[t] = dft
@@ -214,7 +268,8 @@ def load_prices(tickers_raw: str, start, end):
                 if "Adj Close" not in dft.columns and "Close" in dft.columns:
                     dft["Adj Close"] = dft["Close"]
                 dft = dft[["Open", "High", "Low", "Close", "Adj Close", "Volume"]].dropna(how="all")
-                if not dft.empty: results[t] = dft
+                if not dft.empty:
+                    results[t] = dft
         except Exception:
             pass
 
@@ -226,38 +281,33 @@ def load_prices(tickers_raw: str, start, end):
             st.info(f"Using Alpha Vantage for: {', '.join(final_missing)}")
             for i, t in enumerate(final_missing):
                 base = t.split(".")[0]
-                candidates = [t]  # raw (in case user typed NSE:XXX directly)
-                #if t.endswith(".NS"):
-                    #candidates.append(f"NSE:{base}")   # e.g., ADANIPORTS.NS -> NSE:ADANIPORTS
-                #if t.endswith(".BO"):
-                    #candidates.append(f"BSE:{base}")   # e.g., 532921.BO -> BSE:532921
-if t.endswith(".NS"):
-    base = t.split(".")[0]
-    candidates.append(f"NSE:{base}")
-elif t.endswith(".BO"):
-    base = t.split(".")[0]
-    candidates.append(f"BSE:{base}")
-else:
-    candidates.append(f"NSE:{t}")  # allow plain NSE:SYMBOL too
+                candidates = [t]  # raw (in case user passes NSE:XXX directly)
+                if t.endswith(".NS"):
+                    candidates.append(f"NSE:{base}")   # e.g., ADANIPORTS.NS -> NSE:ADANIPORTS
+                elif t.endswith(".BO"):
+                    candidates.append(f"BSE:{base}")   # e.g., 532921.BO -> BSE:532921
+                else:
+                    # Also try assuming NSE if user typed plain symbol without suffix/prefix
+                    candidates.append(f"NSE:{t}")
 
-got = False
-for sym in candidates:
-    dft = av_fetch_one(sym, start, end_inclusive)
-    if not dft.empty:
-        results[t] = dft
-        got = True
-        break
+                got = False
+                for sym in candidates:
+                    dft = av_fetch_one(sym, start, end_inclusive)
+                    if not dft.empty:
+                        results[t] = dft
+                        got = True
+                        break
 
                 # Respect AV free rate limit (~5 calls/min)
-    if i < len(final_missing) - 1:
-        time.sleep(12)
-    else:
-        st.warning("Alpha Vantage key not set; skipping AV fallback.")
+                if i < len(final_missing) - 1:
+                    time.sleep(12)
+        else:
+            st.warning("Alpha Vantage key not set; skipping AV fallback.")
 
     if not results:
-    return {}
+        return {}
 
-    # Align calendars (intersection)
+    # Align calendars (intersection of all dates)
     common_idx = sorted(set.intersection(*[set(df.index) for df in results.values()]))
     if not common_idx:
         return {}
@@ -267,9 +317,15 @@ for sym in candidates:
 # =========================
 # Backtest (per ticker)
 # =========================
-def backtest(df: pd.DataFrame, strategy: str, params: dict,
-             vol_target: float, long_only: bool,
-             atr_stop: float, take_profit: float):
+def backtest(
+    df: pd.DataFrame,
+    strategy: str,
+    params: dict,
+    vol_target: float,
+    long_only: bool,
+    atr_stop: float,
+    take_profit: float,
+):
     price = df[price_column(df)]
     rets = price.pct_change().fillna(0.0)
 
@@ -290,7 +346,7 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
         "CAGR": round(annualized_return(pnl), 4),
         "Sharpe": round(sharpe(pnl), 2),
         "MaxDD": round(max_drawdown(equity)[0], 4),
-        "Exposure": round(float((pnl != 0).sum())/len(pnl) if len(pnl)>0 else 0.0, 3),
+        "Exposure": round(float((pnl != 0).sum()) / len(pnl) if len(pnl) > 0 else 0.0, 3),
         "LastEquity": round(float(equity.iloc[-1]) if not equity.empty else 1.0, 4),
     }
     return equity, stats
@@ -305,9 +361,8 @@ st.caption("SMA crossover & RSI mean-reversion with vol targeting + ATR stops. D
 with st.sidebar:
     st.header("Settings")
 
-    # ---- Hard-coded tickers for your single test ----
-    tickers = "TATASTEEL, RELIANCE"
-    st.text_input("Tickers (hard-coded for test)", value=tickers, disabled=True)
+    # Default to your NSE test; you can edit it in the box
+    tickers = st.text_input("Tickers", value="NSE:TATASTEEL, NSE:RELIANCE")
 
     start = st.date_input("Start date", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
     end = st.date_input("End date", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
@@ -335,11 +390,10 @@ with st.expander("🔧 Diagnostics"):
     st.write("yfinance version:", getattr(yf, "__version__", "unknown"))
     has_av = bool(os.environ.get("ALPHAVANTAGE_API_KEY") or st.secrets.get("ALPHAVANTAGE_API_KEY", None))
     st.write("Alpha Vantage key detected:", has_av)
-
-    # Clear Streamlit cache button
     if st.button("Clear data cache"):
         load_prices.clear()
         st.success("Cache cleared. Run again.")
+
 
 # =========================
 # Run
@@ -348,12 +402,11 @@ if run_btn:
     data = load_prices(tickers, start, end)
 
     if not data:
-        st.error("No data downloaded from Yahoo, Stooq, or Alpha Vantage. Check dates or API rate limits.")
+        st.error("No data downloaded from Yahoo, Stooq, or Alpha Vantage. Check tickers, dates, or API rate limits.")
         st.stop()
 
     st.caption("Loaded data for → " + ", ".join(sorted(data.keys())))
 
-    # Per-ticker tabs
     results = []
     tabs = st.tabs(list(data.keys()))
     for tab, t in zip(tabs, data.keys()):
@@ -372,8 +425,10 @@ if run_btn:
         res_df = pd.DataFrame(results)
         st.subheader("📋 Summary")
         st.dataframe(res_df, use_container_width=True)
-        st.download_button("Download Results CSV",
-                           res_df.to_csv(index=False).encode(),
-                           file_name="results_summary.csv")
+        st.download_button(
+            "Download Results CSV",
+            res_df.to_csv(index=False).encode(),
+            file_name="results_summary.csv",
+        )
 else:
     st.info("Set parameters in the sidebar, then click **Run Backtest**.")
