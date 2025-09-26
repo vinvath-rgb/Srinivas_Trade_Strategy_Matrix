@@ -27,7 +27,8 @@ def diag_fetch(ticker="AAPL"):
             interval="1d",
             auto_adjust=False,
             progress=False,
-            threads=False
+            threads=False,
+            proxy=None
         )
         return df.head(), df.shape
     except Exception as e:
@@ -65,6 +66,8 @@ def load_prices(tickers_raw: str, start, end):
             progress=False,
             group_by="ticker",
             threads=False,  # safer on some hosts
+            timeout=60,
+            proxy=None
         )
         if isinstance(df.columns, pd.MultiIndex):  # multiple tickers → multiindex columns
             for t in tickers:
