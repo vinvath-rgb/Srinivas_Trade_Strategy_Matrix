@@ -239,13 +239,14 @@ elif t.endswith(".BO"):
     candidates.append(f"BSE:{base}")
 else:
     candidates.append(f"NSE:{t}")  # allow plain NSE:SYMBOL too
-                got = False
-                for sym in candidates:
-                    dft = av_fetch_one(sym, start, end_inclusive)
-                    if not dft.empty:
-                        results[t] = dft
-                        got = True
-                        break
+
+got = False
+for sym in candidates:
+    dft = av_fetch_one(sym, start, end_inclusive)
+    if not dft.empty:
+        results[t] = dft
+        got = True
+        break
 
                 # Respect AV free rate limit (~5 calls/min)
                 if i < len(final_missing) - 1:
