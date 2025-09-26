@@ -249,10 +249,10 @@ for sym in candidates:
         break
 
                 # Respect AV free rate limit (~5 calls/min)
-                if i < len(final_missing) - 1:
-                    time.sleep(12)
-        else:
-            st.warning("Alpha Vantage key not set; skipping AV fallback.")
+    if i < len(final_missing) - 1:
+        time.sleep(12)
+    else:
+        st.warning("Alpha Vantage key not set; skipping AV fallback.")
 
     if not results:
         return {}
