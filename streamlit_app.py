@@ -1,9 +1,8 @@
-
-# -----------------------------------------------------
-import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
 import yfinance as yf
+import streamlit as st
+import time
 
 st.set_page_config(page_title="Srini Algo Backtester", layout="wide")
 
@@ -86,37 +85,76 @@ def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> p
     sig[r > rsi_sell] = -1.0
     return sig.fillna(0.0)
 
-@st.cache_data(show_spinner=False)
-#def load_data(tickers, start, end):
-    #data = {}
-    #for t in tickers:
-        #df = yf.download(t, start=start, end=end, auto_adjust=False, progress=False)
-        #if not df.empty:
-            #df = df.dropna().copy()
-            #data[t] = df
-    #return data
+# ---------- Robust Yahoo loader ----------
+def _to_ts(d):
+    """Accept 'YYYY-MM-DD' or 'YYYY/MM/DD' or date objects; return tz-naive Timestamp."""
+    return pd.to_datetime(d).tz_localize(None)
 
-def backtest(df: pd.DataFrame, strategy: str, params: dict, vol_target: float, long_only: bool, atr_stop: float, take_profit: float):
-    price = df['Adj Close']
-    rets = price.pct_change().fillna(0.0)
-    if strategy == "SMA Crossover":
-        sig = sma_signals(price, params["fast"], params["slow"])
-    else:
-        sig = rsi_signals(price, params["rsi_lb"], params["rsi_buy"], params["rsi_sell"])
-    if long_only:
-        sig = sig.clip(lower=0.0)
-    pos = position_sizer(sig, rets, vol_target)
-    atr = compute_atr(df, lb=14)
-    pnl = apply_stops(df, pos, atr, atr_stop, take_profit)
-    equity = (1 + pnl).cumprod()
-    stats = {
-        "CAGR": round(annualized_return(pnl), 4),
-        "Sharpe": round(sharpe(pnl), 2),
-        "MaxDD": round(max_drawdown(equity)[0], 4),
-        "Exposure": round(float((pnl != 0).sum())/len(pnl) if len(pnl)>0 else 0.0, 3),
-        "LastEquity": round(float(equity.iloc[-1]) if not equity.empty else 1.0, 4),
-    }
-    return equity, stats
+@st.cache_data(show_spinner=False)
+def load_prices(tickers_raw: str, start, end):
+    """
+    Downloads daily OHLCV from Yahoo for comma-separated tickers.
+    - Includes the typed end date (yfinance end is exclusive).
+    - Tries batch download first, then per-ticker with retries.
+    - Returns dict: {ticker: DataFrame with aligned index}
+    """
+    tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
+    if not tickers:
+        return {}
+
+    start = _to_ts(start)
+    end = _to_ts(end)
+    end_inclusive = end + pd.Timedelta(days=1)  # include end date
+
+    results = {}
+
+    # Fast path: batch download
+    try:
+        df = yf.download(
+            tickers=tickers,
+            start=start,
+            end=end_inclusive,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            group_by="ticker",
+            threads=False
+        )
+        if isinstance(df.columns, pd.MultiIndex):
+            for t in tickers:
+                if t in df.columns.get_level_values(0):
+                    sub = df[t].dropna(how="all").copy()
+                    if not sub.empty:
+                        results[t] = sub
+        else:
+            if not df.empty and len(tickers) == 1:
+                results[tickers[0]] = df.dropna(how="all").copy()
+    except Exception:
+        pass  # fall back
+
+    # Fallback: per-ticker with retries/backoff
+    missing = [t for t in tickers if t not in results]
+    for t in missing:
+        for attempt in range(1, 4):
+            try:
+                dft = yf.download(
+                    t, start=start, end=end_inclusive,
+                    interval="1d", auto_adjust=False, progress=False
+                ).dropna(how="all")
+                if not dft.empty:
+                    results[t] = dft
+                    break
+            except Exception:
+                pass
+            time.sleep(1.5 * attempt)
+
+    if not results:
+        return {}
+
+    # Align on common calendar (intersection)
+    common_idx = sorted(set.intersection(*[set(df.index) for df in results.values()]))
+    results = {t: df.loc[common_idx].copy() for t, df in results.items() if not df.empty}
+    return results
 
 # ---------- UI ----------
 st.title("📈 Srini’s Algo Backtester")
@@ -124,7 +162,7 @@ st.caption("SMA crossover & RSI mean-reversion with vol targeting + ATR stops. E
 
 with st.sidebar:
     st.header("Settings")
-    tickers = st.text_input("Tickers (comma-separated)", value="SPY,QQQ")
+    tickers = st.text_input("Tickers (comma-separated)", value="AAPL,MSFT")
     start = st.date_input("Start date", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
     end = st.date_input("End date", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
 
@@ -147,33 +185,56 @@ with st.sidebar:
 
     run_btn = st.button("Run Backtest")
 
-if run_btn:
-    tlist = [t.strip() for t in tickers.split(",") if t.strip()]
-    data = load_data(tlist, start, end)
-    if not data:
-        st.warning("No data downloaded. Check tickers or date range.")
+# ---------- Backtest driver ----------
+def backtest(df: pd.DataFrame, strategy: str, params: dict, vol_target: float, long_only: bool, atr_stop: float, take_profit: float):
+    price = df['Adj Close']
+    rets = price.pct_change().fillna(0.0)
+    if strategy == "SMA Crossover":
+        sig = sma_signals(price, params["fast"], params["slow"])
     else:
-        results = []
-        tabs = st.tabs(tlist)
-        for tab, t in zip(tabs, tlist):
-            df = data.get(t)
-            with tab:
-                if df is None or df.empty:
-                    st.warning(f"No data for {t}"); continue
-                equity, stats = backtest(df, strategy, params, vol_target, long_only, atr_stop, take_profit)
-                st.subheader(f"{t} – Equity Curve")
-                st.line_chart(equity, height=300)
-                st.write("**Stats**:", stats)
+        sig = rsi_signals(price, params["rsi_lb"], params["rsi_buy"], params["rsi_sell"])
+    if long_only:
+        sig = sig.clip(lower=0.0)
+    pos = position_sizer(sig, rets, vol_target)
+    atr = compute_atr(df, lb=14)
+    pnl = apply_stops(df, pos, atr, atr_stop, take_profit)
+    equity = (1 + pnl).cumprod()
+    stats = {
+        "CAGR": round(annualized_return(pnl), 4),
+        "Sharpe": round(sharpe(pnl), 2),
+        "MaxDD": round(max_drawdown(equity)[0], 4),
+        "Exposure": round(float((pnl != 0).sum())/len(pnl) if len(pnl)>0 else 0.0, 3),
+        "LastEquity": round(float(equity.iloc[-1]) if not equity.empty else 1.0, 4),
+    }
+    return equity, stats
 
-        # Combined CSV of last run stats
-        for t in tlist:
-            df = data.get(t)
-            if df is None or df.empty: continue
-            eq, stx = backtest(df, strategy, params, vol_target, long_only, atr_stop, take_profit)
-            results.append({"Ticker": t, **stx})
-        if results:
-            res_df = pd.DataFrame(results)
-            st.dataframe(res_df, use_container_width=True)
-            st.download_button("Download Results CSV", res_df.to_csv(index=False).encode(), file_name="results_summary.csv")
+if run_btn:
+    data = load_prices(tickers, start, end)
+
+    if not data:
+        st.error("No data downloaded. Check tickers (e.g., AAPL,MSFT or RELIANCE.NS) and date range.")
+        st.stop()
+
+    results = []
+    tabs = st.tabs(list(data.keys()))
+    for tab, t in zip(tabs, data.keys()):
+        df = data[t]
+        with tab:
+            if df is None or df.empty:
+                st.warning(f"No data for {t}"); continue
+            equity, stats = backtest(df, strategy, params, vol_target, long_only, atr_stop, take_profit)
+            st.subheader(f"{t} – Equity Curve")
+            st.line_chart(equity, height=300)
+            st.write("**Stats**:", stats)
+
+    # Combined summary
+    for t, df in data.items():
+        if df is None or df.empty: continue
+        eq, stx = backtest(df, strategy, params, vol_target, long_only, atr_stop, take_profit)
+        results.append({"Ticker": t, **stx})
+    if results:
+        res_df = pd.DataFrame(results)
+        st.dataframe(res_df, use_container_width=True)
+        st.download_button("Download Results CSV", res_df.to_csv(index=False).encode(), file_name="results_summary.csv")
 else:
     st.info("Set your tickers & parameters in the sidebar, then click **Run Backtest**.")
