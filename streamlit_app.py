@@ -115,7 +115,7 @@ def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> p
 
 
 # =========================
-# Data fetchers (Yahoo / Stooq / Alpha Vantage)
+# Alpha Vantage fetcher
 # =========================
 def av_fetch_one(ticker: str, start, end):
     """
@@ -149,6 +149,9 @@ def av_fetch_one(ticker: str, start, end):
         return pd.DataFrame()
 
 
+# =========================
+# Data loader (Yahoo -> Stooq -> Alpha Vantage)
+# =========================
 @st.cache_data(show_spinner=False)
 def load_prices(tickers_raw: str, start, end):
     """
@@ -215,21 +218,33 @@ def load_prices(tickers_raw: str, start, end):
         except Exception:
             pass
 
-    # 4) Alpha Vantage fallback
+    # 4) Alpha Vantage fallback (try symbol variants for NSE/BSE)
     final_missing = [t for t in tickers if t not in results]
     if final_missing:
         has_key = bool(os.environ.get("ALPHAVANTAGE_API_KEY") or st.secrets.get("ALPHAVANTAGE_API_KEY", None))
         if has_key:
             st.info(f"Using Alpha Vantage for: {', '.join(final_missing)}")
             for i, t in enumerate(final_missing):
-                dft = av_fetch_one(t, start, end_inclusive)
-                if not dft.empty:
-                    results[t] = dft
+                base = t.split(".")[0]
+                candidates = [t]  # raw (in case user typed NSE:XXX directly)
+                if t.endswith(".NS"):
+                    candidates.append(f"NSE:{base}")   # e.g., ADANIPORTS.NS -> NSE:ADANIPORTS
+                if t.endswith(".BO"):
+                    candidates.append(f"BSE:{base}")   # e.g., 532921.BO -> BSE:532921
+
+                got = False
+                for sym in candidates:
+                    dft = av_fetch_one(sym, start, end_inclusive)
+                    if not dft.empty:
+                        results[t] = dft
+                        got = True
+                        break
+
+                # Respect AV free rate limit (~5 calls/min)
                 if i < len(final_missing) - 1:
-                    time.sleep(12)  # free tier ~5 calls/min
+                    time.sleep(12)
         else:
-            if final_missing:
-                st.warning("Alpha Vantage key not set; skipping AV fallback.")
+            st.warning("Alpha Vantage key not set; skipping AV fallback.")
 
     if not results:
         return {}
@@ -277,11 +292,15 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
 # UI
 # =========================
 st.title("📈 Srini’s Algo Backtester")
-st.caption("SMA crossover & RSI mean-reversion with vol targeting + ATR stops. Data sources: Yahoo → Stooq → Alpha Vantage.")
+st.caption("SMA crossover & RSI mean-reversion with vol targeting + ATR stops. Data: Yahoo → Stooq → Alpha Vantage.")
 
 with st.sidebar:
     st.header("Settings")
-    tickers = st.text_input("Tickers (comma-separated)", value="AAPL,MSFT")
+
+    # ---- Hard-coded tickers for your single test ----
+    tickers = "TATASTEEL.NS, RELIANCE.NS"
+    st.text_input("Tickers (hard-coded for test)", value=tickers, disabled=True)
+
     start = st.date_input("Start date", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
     end = st.date_input("End date", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
 
@@ -297,8 +316,8 @@ with st.sidebar:
         rsi_sell = st.number_input("RSI Sell >", min_value=50, max_value=95, value=70, step=1)
         params = {"rsi_lb": int(rsi_lb), "rsi_buy": int(rsi_buy), "rsi_sell": int(rsi_sell)}
 
-    long_only = st.checkbox("Long-only", value=False)
-    vol_target = st.slider("Vol target (annualized)", 0.05, 0.40, 0.15, 0.01)
+    long_only = st.checkbox("Long-only", value=True)
+    vol_target = st.slider("Vol target (annualized)", 0.05, 0.40, 0.12, 0.01)
     atr_stop = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5)
     take_profit = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5)
 
@@ -306,6 +325,13 @@ with st.sidebar:
 
 with st.expander("🔧 Diagnostics"):
     st.write("yfinance version:", getattr(yf, "__version__", "unknown"))
+    has_av = bool(os.environ.get("ALPHAVANTAGE_API_KEY") or st.secrets.get("ALPHAVANTAGE_API_KEY", None))
+    st.write("Alpha Vantage key detected:", has_av)
+
+    # Clear Streamlit cache button
+    if st.button("Clear data cache"):
+        load_prices.clear()
+        st.success("Cache cleared. Run again.")
 
 # =========================
 # Run
@@ -314,7 +340,7 @@ if run_btn:
     data = load_prices(tickers, start, end)
 
     if not data:
-        st.error("No data downloaded from Yahoo, Stooq, or Alpha Vantage. Check tickers and dates.")
+        st.error("No data downloaded from Yahoo, Stooq, or Alpha Vantage. Check dates or API rate limits.")
         st.stop()
 
     st.caption("Loaded data for → " + ", ".join(sorted(data.keys())))
@@ -342,4 +368,4 @@ if run_btn:
                            res_df.to_csv(index=False).encode(),
                            file_name="results_summary.csv")
 else:
-    st.info("Set your tickers & parameters in the sidebar, then click **Run Backtest**.")
+    st.info("Set parameters in the sidebar, then click **Run Backtest**.")
