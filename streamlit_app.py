@@ -87,14 +87,14 @@ def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> p
     return sig.fillna(0.0)
 
 @st.cache_data(show_spinner=False)
-def load_data(tickers, start, end):
-    data = {}
-    for t in tickers:
-        df = yf.download(t, start=start, end=end, auto_adjust=False, progress=False)
-        if not df.empty:
-            df = df.dropna().copy()
-            data[t] = df
-    return data
+#def load_data(tickers, start, end):
+    #data = {}
+    #for t in tickers:
+        #df = yf.download(t, start=start, end=end, auto_adjust=False, progress=False)
+        #if not df.empty:
+            #df = df.dropna().copy()
+            #data[t] = df
+    #return data
 
 def backtest(df: pd.DataFrame, strategy: str, params: dict, vol_target: float, long_only: bool, atr_stop: float, take_profit: float):
     price = df['Adj Close']
