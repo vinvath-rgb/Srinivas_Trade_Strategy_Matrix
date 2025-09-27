@@ -1,8 +1,9 @@
-# Srini All-In-One Backtester
-# - NSE (India) via monthly bhavcopy ZIPs (official EOD) with optional prefetch step
-# - US/Global via yfinance -> Stooq fallback
-# - Per-ticker results (no strict date intersection)
-# - SMA/RSI, vol targeting, ATR stops, take-profit
+# Srini Backtester (All-in-one, Hybrid NSE + yfinance/Stooq)
+# - NSE India via monthly bhavcopy (completed months) + daily bhavcopy (partial months)
+# - US/Global via yfinance -> Stooq
+# - Optional Step-1 NSE prefetch with progress bar
+# - No strict date intersection; per-ticker results
+# - SMA/RSI + vol targeting + ATR stop/TP
 
 import io
 import time
@@ -14,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 from pandas_datareader import data as pdr
 
-st.set_page_config(page_title="Srini Backtester (All-in-one)", layout="wide")
+st.set_page_config(page_title="Srini Backtester (All-in-one Hybrid NSE)", layout="wide")
 
 # =========================
 # General utilities
@@ -124,7 +125,7 @@ def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> p
     return sig.fillna(0.0)
 
 # =========================
-# NSE monthly bhavcopy (official EOD)
+# NSE (monthly + daily) — official EOD bhavcopy
 # =========================
 NSE = requests.Session()
 NSE.headers.update({
@@ -150,6 +151,16 @@ def _monthly_urls_for(anchor: pd.Timestamp) -> list[str]:
         f"https://www1.nseindia.com/content/historical/EQUITIES/{y}/{mon}/{fname}",
     ]
 
+def _daily_urls_for(date: pd.Timestamp) -> list[str]:
+    y   = date.strftime("%Y")
+    mon = date.strftime("%b").upper()       # SEP
+    dmy = date.strftime("%d%b%Y").upper()   # 01SEP2025
+    fname = f"cm{dmy}bhav.csv.zip"
+    return [
+        f"https://archives.nseindia.com/content/historical/EQUITIES/{y}/{mon}/{fname}",
+        f"https://www1.nseindia.com/content/historical/EQUITIES/{y}/{mon}/{fname}",
+    ]
+
 @st.cache_data(show_spinner=False)
 def fetch_month_df(anchor: pd.Timestamp, debug_http: bool = False, max_retries: int = 2) -> pd.DataFrame:
     """Download one monthly ZIP; return normalized DataFrame with DATE/SYMBOL/OHLCV/Adj Close."""
@@ -159,12 +170,11 @@ def fetch_month_df(anchor: pd.Timestamp, debug_http: bool = False, max_retries: 
         for attempt in range(1, max_retries + 1):
             try:
                 r = NSE.get(url, timeout=25)
-                if debug_http: st.write(f"GET {url} -> {r.status_code}")
+                if debug_http: st.write(f"GET (monthly) {url} -> {r.status_code}")
                 if r.status_code == 200:
                     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
                         with z.open(z.namelist()[0]) as f:
                             raw = pd.read_csv(f)
-                    # Robust date parse (fixes tiny windows)
                     raw["DATE"] = pd.to_datetime(
                         raw["TIMESTAMP"].astype(str).str.strip(),
                         format="%d-%b-%Y", errors="coerce"
@@ -189,32 +199,99 @@ def fetch_month_df(anchor: pd.Timestamp, debug_http: bool = False, max_retries: 
                 time.sleep(0.8 * attempt); continue
     return pd.DataFrame()
 
+@st.cache_data(show_spinner=False)
+def fetch_daily_df(day: pd.Timestamp, debug_http: bool = False, max_retries: int = 2) -> pd.DataFrame:
+    """Download one daily ZIP for a specific date (used for partial/current month)."""
+    _nse_prime()
+    urls = _daily_urls_for(day)
+    for url in urls:
+        for attempt in range(1, max_retries + 1):
+            try:
+                r = NSE.get(url, timeout=20)
+                if debug_http: st.write(f"GET (daily) {url} -> {r.status_code}")
+                if r.status_code == 200:
+                    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                        with z.open(z.namelist()[0]) as f:
+                            raw = pd.read_csv(f)
+                    raw["DATE"] = pd.to_datetime(
+                        raw["TIMESTAMP"].astype(str).str.strip(),
+                        format="%d-%b-%Y", errors="coerce"
+                    )
+                    raw = raw.dropna(subset=["DATE"])
+                    df = pd.DataFrame({
+                        "DATE": raw["DATE"],
+                        "SYMBOL": raw["SYMBOL"].astype(str).str.upper(),
+                        "Open": pd.to_numeric(raw["OPEN"], errors="coerce"),
+                        "High": pd.to_numeric(raw["HIGH"], errors="coerce"),
+                        "Low":  pd.to_numeric(raw["LOW"],  errors="coerce"),
+                        "Close":pd.to_numeric(raw["CLOSE"],errors="coerce"),
+                        "Volume": pd.to_numeric(raw["TOTTRDQTY"], errors="coerce"),
+                    })
+                    df["Adj Close"] = df["Close"]
+                    return df.dropna(subset=["DATE"]).sort_values("DATE").reset_index(drop=True)
+                elif r.status_code in (403, 429):
+                    time.sleep(1.0 * attempt); continue
+                else:
+                    break
+            except Exception:
+                time.sleep(0.8 * attempt); continue
+    return pd.DataFrame()
+
 def _month_periods(start_dt: pd.Timestamp, end_dt: pd.Timestamp):
     return pd.period_range(start=start_dt, end=end_dt, freq="M")
 
 @st.cache_data(show_spinner=False)
 def concat_months_cached(start_dt: pd.Timestamp, end_dt: pd.Timestamp, debug_http: bool = False) -> pd.DataFrame:
-    """Fetch all months in range (cached per month) and concatenate them."""
+    """
+    Hybrid fetch:
+      - Use MONTHLY ZIPs for fully completed months.
+      - Use DAILY ZIPs for the partial month at the start/end (and for months where monthly 404s).
+    Returns a single normalized DataFrame for the whole range.
+    """
     frames = []
-    months = list(_month_periods(start_dt, end_dt))
+
+    start_dt = pd.to_datetime(start_dt).normalize()
+    end_dt   = pd.to_datetime(end_dt).normalize()
+
+    start_anchor = pd.Timestamp(start_dt.year, start_dt.month, 1)
+    end_anchor   = pd.Timestamp(end_dt.year, end_dt.month, 1)
+
+    months = list(pd.period_range(start=start_anchor, end=end_anchor, freq="M"))
     if months:
-        prog = st.progress(0, text="Fetching NSE monthly files…")
+        prog = st.progress(0, text="Fetching NSE files…")
+
     for i, m in enumerate(months, start=1):
         anchor = pd.Timestamp(year=m.year, month=m.month, day=1)
-        dfm = fetch_month_df(anchor, debug_http=debug_http)
-        if not dfm.empty:
-            frames.append(dfm)
+
+        monthly_df = fetch_month_df(anchor, debug_http=debug_http)
+        if not monthly_df.empty:
+            frames.append(monthly_df)
+        else:
+            # monthly not available -> use daily for the span of this month within [start_dt, end_dt]
+            month_start = max(start_dt, anchor)
+            month_end   = min(end_dt, (anchor + pd.offsets.MonthEnd(0)))
+            days = pd.bdate_range(month_start, month_end, freq="C")
+            for d in days:
+                ddf = fetch_daily_df(d, debug_http=debug_http)
+                if not ddf.empty:
+                    frames.append(ddf)
+
         if months:
             prog.progress(i / len(months), text=f"Fetched {m.strftime('%b %Y')} ({i}/{len(months)})")
+
     if months:
         prog.empty()
+
     if not frames:
         return pd.DataFrame()
+
     big = pd.concat(frames, ignore_index=True)
-    big = big.dropna(subset=["DATE"]).sort_values("DATE").reset_index(drop=True)
+    big = big.dropna(subset=["DATE"])
+    big = big[(big["DATE"] >= start_dt) & (big["DATE"] <= end_dt)]
+    big = big.sort_values("DATE").reset_index(drop=True)
     return big
 
-# Session store (Step-1 cache)
+# Session store for optional prefetch
 if "nse_store" not in st.session_state:
     st.session_state.nse_store = pd.DataFrame()
 if "nse_ready" not in st.session_state:
@@ -225,7 +302,7 @@ if "nse_ready" not in st.session_state:
 # =========================
 @st.cache_data(show_spinner=False)
 def load_prices_from_store(store: pd.DataFrame, tickers_raw: str, start: str, end: str) -> dict:
-    """Use pre-fetched NSE store for *.NS tickers; others ignored here."""
+    """Use pre-fetched NSE store for *.NS tickers only."""
     out = {}
     if store is None or store.empty:
         return out
@@ -248,7 +325,10 @@ def load_prices_from_store(store: pd.DataFrame, tickers_raw: str, start: str, en
 
 @st.cache_data(show_spinner=False)
 def load_prices_live(tickers_raw: str, start, end) -> dict:
-    """US/Global via yfinance -> Stooq. Also tries NSE monthly (on-the-fly) for .NS if store not available."""
+    """
+    US/Global via yfinance -> Stooq.
+    Also tries NSE monthly/daily on-the-fly for .NS if prefetch not used.
+    """
     tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
     if not tickers: return {}
 
@@ -258,13 +338,12 @@ def load_prices_live(tickers_raw: str, start, end) -> dict:
 
     results = {}
 
-    # 1) Try yfinance batch for all tickers (works for many .NS as well)
+    # 1) yfinance batch
     try:
         df = yf.download(
             tickers=tickers,
             start=start, end=end_inclusive,
-            interval="1d",
-            auto_adjust=False, progress=False,
+            interval="1d", auto_adjust=False, progress=False,
             group_by="ticker", threads=False, timeout=60, proxy=None
         )
         if isinstance(df.columns, pd.MultiIndex):
@@ -280,7 +359,7 @@ def load_prices_live(tickers_raw: str, start, end) -> dict:
     except Exception:
         pass
 
-    # 2) Retry per ticker
+    # 2) yfinance per-ticker retries
     remaining = [t for t in tickers if t not in results]
     for t in remaining:
         try:
@@ -294,29 +373,46 @@ def load_prices_live(tickers_raw: str, start, end) -> dict:
             pass
         time.sleep(0.8)
 
-    # 3) For any .NS still missing, try NSE monthly on-the-fly (single month range)
+    # 3) For .NS still missing, try NSE on-the-fly (monthly + daily hybrid)
     still = [t for t in remaining if t not in results and t.endswith(".NS")]
-    for t in still:
-        base = t.replace(".NS", "")
-        sdt = _to_ts(start); edt = _to_ts(end)
+    if still:
+        sdt = start; edt = end
         months = list(_month_periods(sdt, edt))
-        frames = []
+        month_frames = {}
+        # fetch needed months/days once
         for m in months:
             anchor = pd.Timestamp(year=m.year, month=m.month, day=1)
             dfm = fetch_month_df(anchor, debug_http=False)
             if not dfm.empty:
-                sub = dfm[dfm["SYMBOL"] == base].copy()
+                month_frames[anchor] = dfm
+            else:
+                # daily fallback for this month window
+                month_start = max(sdt, anchor)
+                month_end   = min(edt, (anchor + pd.offsets.MonthEnd(0)))
+                days = pd.bdate_range(month_start, month_end, freq="C")
+                dframes = []
+                for d in days:
+                    ddf = fetch_daily_df(d, debug_http=False)
+                    if not ddf.empty:
+                        dframes.append(ddf)
+                if dframes:
+                    month_frames[anchor] = pd.concat(dframes, ignore_index=True)
+
+        for t in still:
+            base = t.replace(".NS", "")
+            frames = []
+            for dfm in month_frames.values():
+                sub = dfm[dfm["SYMBOL"] == base]
                 if not sub.empty:
                     sub = sub[(sub["DATE"] >= sdt) & (sub["DATE"] <= edt)]
                     if not sub.empty:
-                        sub["Adj Close"] = sub["Close"]
                         frames.append(sub)
-        if frames:
-            tmp = pd.concat(frames, ignore_index=True).sort_values("DATE")
-            dfx = tmp[["DATE","Open","High","Low","Close","Adj Close","Volume"]].set_index("DATE")
-            results[t] = dfx
+            if frames:
+                tmp = pd.concat(frames, ignore_index=True).sort_values("DATE")
+                dfx = tmp[["DATE","Open","High","Low","Close","Adj Close","Volume"]].set_index("DATE")
+                results[t] = dfx
 
-    # 4) Stooq fallback for whatever is still missing
+    # 4) Stooq fallback
     still2 = [t for t in tickers if t not in results]
     for t in still2:
         try:
@@ -332,7 +428,7 @@ def load_prices_live(tickers_raw: str, start, end) -> dict:
         except Exception:
             pass
 
-    # Clean, no intersection
+    # Clean each df (no intersection)
     cleaned = {}
     for t, df in results.items():
         if df is None or df.empty: continue
@@ -346,16 +442,14 @@ def load_prices_all(tickers: str, start: str, end: str) -> dict:
     """
     Unified entry:
       - If Step-1 NSE store is ready, use it for .NS tickers.
-      - For others, or any missing .NS, use live loader (yfinance -> Stooq -> NSE on-the-fly).
+      - For others, or any missing .NS, use live loader (yfinance -> Stooq -> NSE hybrid).
     """
     data = {}
 
-    # 1) Use cached NSE store if present
     if st.session_state.get("nse_ready") and not st.session_state.get("nse_store", pd.DataFrame()).empty:
         from_store = load_prices_from_store(st.session_state.nse_store, tickers, start, end)
         data.update(from_store)
 
-    # 2) For anything still missing (including all non-.NS), hit live loaders
     wanted = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     missing = [t for t in wanted if t not in data]
     if missing:
@@ -396,17 +490,17 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
 # =========================
 # UI
 # =========================
-st.title("📈 Srini Backtester (All-in-one)")
-st.caption("NSE monthly bhavcopy for *.NS (optional prefetch) + yfinance → Stooq for others. "
+st.title("📈 Srini Backtester (All-in-one Hybrid NSE)")
+st.caption("NSE monthly (completed months) + daily (partial months) for *.NS, yfinance → Stooq for others. "
            "SMA/RSI with vol targeting & ATR stops.")
 
 with st.sidebar:
-    st.header("Step 1 — (Optional) Prefetch NSE monthly files")
+    st.header("Step 1 — (Optional) Prefetch NSE files")
     start_pref = st.date_input("Prefetch start", value=pd.to_datetime("2018-01-01")).strftime("%Y-%m-%d")
     end_pref   = st.date_input("Prefetch end", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
     debug_http = st.checkbox("Show NSE HTTP statuses (verbose)", value=False)
     if st.button("Fetch NSE files now"):
-        with st.spinner("Fetching NSE monthly files…"):
+        with st.spinner("Fetching NSE files (monthly + daily for partial months)…"):
             sdt = _to_ts(start_pref).normalize()
             edt = _to_ts(end_pref).normalize()
             store = concat_months_cached(sdt, edt, debug_http=debug_http)
@@ -415,7 +509,7 @@ with st.sidebar:
         if st.session_state.nse_ready:
             st.success("✅ NSE store ready")
         else:
-            st.warning("No NSE monthly files fetched for this range.")
+            st.warning("No NSE files fetched for this range (check date span or diagnostics).")
 
     st.divider()
     st.header("Step 2 — Backtest settings")
@@ -444,8 +538,9 @@ with st.sidebar:
 with st.expander("🔧 Diagnostics / Cache"):
     st.write("yfinance:", getattr(yf, "__version__", "unknown"))
     if st.button("Clear all caches"):
-        fetch_month_df.clear(); concat_months_cached.clear()
+        fetch_month_df.clear(); fetch_daily_df.clear(); concat_months_cached.clear()
         load_prices_from_store.clear(); load_prices_live.clear()
+        st.session_state.nse_store = pd.DataFrame(); st.session_state.nse_ready = False
         st.success("Caches cleared.")
 
 # =========================
@@ -455,7 +550,8 @@ if run_btn:
     data = load_prices_all(tickers, start, end)
 
     if not data:
-        st.error("No data downloaded. Try a different range/tickers. For *.NS, prefetch NSE files in Step 1 for best results.")
+        st.error("No data downloaded. Try a different range/tickers. "
+                 "For *.NS, Prefetch in Step 1 for best reliability.")
         st.stop()
 
     st.caption("Loaded → " + ", ".join(sorted(data.keys())))
@@ -479,4 +575,4 @@ if run_btn:
         st.dataframe(res_df, use_container_width=True)
         st.download_button("Download Results CSV", res_df.to_csv(index=False).encode(), "results_summary.csv")
 else:
-    st.info("Optionally prefetch NSE monthly files (Step 1), then set tickers & dates and click **Run Backtest**.")
+    st.info("Optionally prefetch NSE files (Step 1), then set tickers & dates and click **Run Backtest**.")
