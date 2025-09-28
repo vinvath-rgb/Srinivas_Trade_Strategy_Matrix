@@ -489,79 +489,75 @@ with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
     vol_target_cmp = st.slider("Vol target (ann.)", 0.05, 0.40, 0.12, 0.01, key="cmp_vol_target")
     atr_stop_cmp   = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5, key="cmp_atr_stop")
     tp_mult_cmp    = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5, key="cmp_tp_mult")
-    
-    
-def interpret_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Interpret metrics vs a benchmark (SPY if present, else highest Sharpe).
-    Handles self-comparison cleanly and uses tolerance for near-equality.
-    """
-    if df.empty:
-        return pd.DataFrame()
 
-    bench = "SPY" if "SPY" in df.index else df["Sharpe"].idxmax()
-    b = df.loc[bench]
-    eps_cagr   = 1e-4   # tolerance for 'equal' growth
-    eps_sharpe = 1e-2   # tolerance for Sharpe
-    eps_dd     = 1e-4   # tolerance for drawdown
+    # ---------- NEW: improved interpretation ----------
+    def interpret_metrics(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Interpret metrics vs a benchmark (SPY if present, else highest Sharpe).
+        Handles self-comparison cleanly and uses tolerance for near-equality.
+        """
+        if df.empty:
+            return pd.DataFrame()
 
-    def label_exposure(x: float) -> str:
-        if x >= 0.8:   return "High exposure"
-        if x >= 0.6:   return "Moderate exposure"
-        if x >= 0.4:   return "Low–Moderate exposure"
-        return "Low exposure"
+        bench = "SPY" if "SPY" in df.index else df["Sharpe"].idxmax()
+        b = df.loc[bench]
+        eps_cagr, eps_sharpe, eps_dd = 1e-4, 1e-2, 1e-4
 
-    out = []
-    for t, r in df.iterrows():
-        if t == bench:
-            out.append({
+        def label_exposure(x: float) -> str:
+            if x >= 0.8:   return "High exposure"
+            if x >= 0.6:   return "Moderate exposure"
+            if x >= 0.4:   return "Low–Moderate exposure"
+            return "Low exposure"
+
+        rows = []
+        for t, r in df.iterrows():
+            if t == bench:
+                rows.append({
+                    "Ticker": t,
+                    "Vs Bench": bench,
+                    "Growth": "Benchmark",
+                    "Risk": "Benchmark",
+                    "Drawdown": "Benchmark",
+                    "Exposure": label_exposure(r.Exposure),
+                    "Suggested Action": "Benchmark"
+                })
+                continue
+
+            # Growth (CAGR)
+            if r.CAGR > b.CAGR + eps_cagr:   growth = "Growth: Higher"
+            elif r.CAGR < b.CAGR - eps_cagr: growth = "Growth: Lower"
+            else:                             growth = "Growth: ~Equal"
+
+            # Risk-adjusted (Sharpe)
+            if r.Sharpe > b.Sharpe + eps_sharpe:   risk = "Risk-adjusted: Better"
+            elif r.Sharpe < b.Sharpe - eps_sharpe: risk = "Risk-adjusted: Worse"
+            else:                                   risk = "Risk-adjusted: ~Equal"
+
+            # Drawdown (less negative is better)
+            if r.MaxDD > b.MaxDD + eps_dd:         dd = "Drawdown: Shallower"
+            elif r.MaxDD < b.MaxDD - eps_dd:       dd = "Drawdown: Deeper"
+            else:                                   dd = "Drawdown: ~Equal"
+
+            if ("Higher" in growth or "~Equal" in growth) and ("Better" in risk or "~Equal" in risk):
+                action = "Keep/Overweight"
+            elif ("Lower" in growth) and ("Worse" in risk):
+                action = "Trim or shift to ETF"
+            else:
+                action = "Hold / partial trim"
+
+            rows.append({
                 "Ticker": t,
                 "Vs Bench": bench,
-                "Growth": "Benchmark",
-                "Risk": "Benchmark",
-                "Drawdown": "Benchmark",
+                "Growth": growth,
+                "Risk": risk,
+                "Drawdown": dd,
                 "Exposure": label_exposure(r.Exposure),
-                "Suggested Action": "Benchmark"
+                "Suggested Action": action
             })
-            continue
 
-        # Growth (CAGR)
-        if r.CAGR > b.CAGR + eps_cagr:   growth = "Growth: Higher"
-        elif r.CAGR < b.CAGR - eps_cagr: growth = "Growth: Lower"
-        else:                             growth = "Growth: ~Equal"
+        return pd.DataFrame(rows).set_index("Ticker")
+    # ---------- end NEW ----------
 
-        # Risk-adjusted (Sharpe)
-        if r.Sharpe > b.Sharpe + eps_sharpe:   risk = "Risk-adjusted: Better"
-        elif r.Sharpe < b.Sharpe - eps_sharpe: risk = "Risk-adjusted: Worse"
-        else:                                   risk = "Risk-adjusted: ~Equal"
-
-        # Drawdown (less negative is better)
-        if r.MaxDD > b.MaxDD + eps_dd:         dd = "Drawdown: Shallower"
-        elif r.MaxDD < b.MaxDD - eps_dd:       dd = "Drawdown: Deeper"
-        else:                                   dd = "Drawdown: ~Equal"
-
-        expo = label_exposure(r.Exposure)
-
-        # Action suggestion
-        if ("Higher" in growth or "~Equal" in growth) and ("Better" in risk or "~Equal" in risk):
-            action = "Keep/Overweight"
-        elif ("Lower" in growth) and ("Worse" in risk):
-            action = "Trim or shift to ETF"
-        else:
-            action = "Hold / partial trim"
-
-        out.append({
-            "Ticker": t,
-            "Vs Bench": bench,
-            "Growth": growth,
-            "Risk": risk,
-            "Drawdown": dd,
-            "Exposure": expo,
-            "Suggested Action": action
-        })
-
-    return pd.DataFrame(out).set_index("Ticker")
-    
     if st.button("Run comparison", key="btn_run_cmp"):
         tickers_cmp = [t.strip().upper() for t in universe.split(",") if t.strip()]
         data_cmp = load_prices(",".join(tickers_cmp), start_cmp, end_cmp)
@@ -597,7 +593,9 @@ def interpret_metrics(df: pd.DataFrame) -> pd.DataFrame:
             st.subheader("Normalized Equity Curves (start = 1.0)")
             st.line_chart(combined, height=360)
 
+        # ✅ Build and SHOW interpretation table
         st.subheader("Interpretation vs Benchmark")
         interp_df = interpret_metrics(res)
         st.dataframe(interp_df, use_container_width=True)
-        st.download_button("Download Interpretation CSV", interp_df.to_csv().encode(), "interpretation.csv", key="dl_interp")
+        st.download_button("Download Interpretation CSV", interp_df.to_csv().encode(),
+                           "interpretation.csv", key="dl_interp")
