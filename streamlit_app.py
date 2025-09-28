@@ -1,9 +1,10 @@
-# Srini Backtester (All-in-one, Hybrid NSE + yfinance/Stooq)
+# Srini Backtester (All-in-one, Hybrid NSE + yfinance/Stooq) with SMA Crossover Visuals
 # - NSE India via monthly bhavcopy (completed months) + daily bhavcopy (partial months)
 # - US/Global via yfinance -> Stooq
 # - Optional Step-1 NSE prefetch with progress bar
-# - No strict date intersection; per-ticker results
+# - Per-ticker results (no strict date intersection)
 # - SMA/RSI + vol targeting + ATR stop/TP
+# - NEW: SMA crossover markers on price chart + crossover events table + "last signal" badge
 
 import io
 import time
@@ -14,6 +15,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 from pandas_datareader import data as pdr
+import matplotlib.pyplot as plt  # NEW: for annotated charts
 
 st.set_page_config(page_title="Srini Backtester (All-in-one Hybrid NSE)", layout="wide")
 
@@ -123,6 +125,33 @@ def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> p
     sig[r < rsi_buy] = 1.0
     sig[r > rsi_sell] = -1.0
     return sig.fillna(0.0)
+
+# NEW: compute SMA crossover events (for display)
+def compute_sma_cross_events(df: pd.DataFrame, fast: int, slow: int):
+    """
+    Returns:
+      ma_f, ma_s (Series),
+      events (DataFrame indexed by Date with columns: Type, Price, FastSMA, SlowSMA)
+    """
+    close = df[price_col(df)]
+    ma_f = close.rolling(fast).mean()
+    ma_s = close.rolling(slow).mean()
+
+    bull = (ma_f.shift(1) <= ma_s.shift(1)) & (ma_f > ma_s)
+    bear = (ma_f.shift(1) >= ma_s.shift(1)) & (ma_f < ma_s)
+
+    mask = bull | bear
+    ev_idx = close.index[mask]
+    ev_type = np.where(bull[mask], "Bullish Cross", "Bearish Cross")
+
+    events = pd.DataFrame({
+        "Type": ev_type,
+        "Price": close.loc[ev_idx].values,
+        "FastSMA": ma_f.loc[ev_idx].values,
+        "SlowSMA": ma_s.loc[ev_idx].values,
+    }, index=ev_idx)
+    events.index.name = "Date"
+    return ma_f, ma_s, events
 
 # =========================
 # NSE (monthly + daily) — official EOD bhavcopy
@@ -492,7 +521,7 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
 # =========================
 st.title("📈 Srini Backtester (All-in-one Hybrid NSE)")
 st.caption("NSE monthly (completed months) + daily (partial months) for *.NS, yfinance → Stooq for others. "
-           "SMA/RSI with vol targeting & ATR stops.")
+           "SMA/RSI with vol targeting & ATR stops. Now with SMA crossover markers & event table.")
 
 with st.sidebar:
     st.header("Step 1 — (Optional) Prefetch NSE files")
@@ -563,9 +592,53 @@ if run_btn:
             if df is None or df.empty:
                 st.warning(f"No data for {t}"); continue
             st.write(f"{t}: {len(df)} rows between {df.index.min().date()} and {df.index.max().date()}")
+
+            # --- Backtest + equity ---
             equity, stats = backtest(df, strategy, params, vol_target, long_only, atr_stop, tp_mult)
             st.subheader(f"{t} — Equity Curve")
             st.line_chart(equity, height=320)
+
+            # --- SMA crossover visuals & events (only when SMA selected) ---
+            if strategy == "SMA Crossover":
+                ma_f, ma_s, events = compute_sma_cross_events(df, params["fast"], params["slow"])
+                close = df[price_col(df)]
+
+                fig, ax = plt.subplots(figsize=(9, 4))
+                ax.plot(df.index, close, label="Close")
+                ax.plot(df.index, ma_f, label=f"SMA {params['fast']}")
+                ax.plot(df.index, ma_s, label=f"SMA {params['slow']}")
+
+                bull_ix = events.index[events["Type"] == "Bullish Cross"]
+                bear_ix = events.index[events["Type"] == "Bearish Cross"]
+                # markers
+                ax.scatter(bull_ix, close.loc[bull_ix], marker="^", s=60, label="Bullish Cross")
+                ax.scatter(bear_ix, close.loc[bear_ix], marker="v", s=60, label="Bearish Cross")
+
+                ax.set_title(f"{t} — Price with SMA Crossovers")
+                ax.legend(loc="best")
+                ax.grid(True, alpha=0.3)
+                st.pyplot(fig, clear_figure=True)
+
+                if not events.empty:
+                    last = events.iloc[-1]
+                    stats["LastSignal"] = f"{last['Type']} @ {last.name.date()} ({last['Price']:.2f})"
+                    st.info(f"Last signal: **{last['Type']}** on **{last.name.date()}** at close **{last['Price']:.2f}**")
+
+                st.subheader("SMA Crossover Events")
+                if events.empty:
+                    st.write("No crossovers in the selected window.")
+                else:
+                    st.dataframe(
+                        events.tail(20).round({"Price": 2, "FastSMA": 2, "SlowSMA": 2}),
+                        use_container_width=True
+                    )
+                    st.download_button(
+                        f"Download crossover events for {t}",
+                        events.to_csv().encode(),
+                        file_name=f"{t}_sma_crossovers.csv"
+                    )
+
+            # --- Stats ---
             st.write("**Stats**:", stats)
             results.append({"Ticker": t, **stats})
 
