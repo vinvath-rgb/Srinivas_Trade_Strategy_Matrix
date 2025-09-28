@@ -490,34 +490,7 @@ with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
     atr_stop_cmp   = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5, key="cmp_atr_stop")
     tp_mult_cmp    = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5, key="cmp_tp_mult")
     
-    """
-    def interpret_metrics(df: pd.DataFrame) -> pd.DataFrame:
-        bench = "SPY" if "SPY" in df.index else df["Sharpe"].idxmax()
-        b = df.loc[bench]
-        out = []
-        for t, r in df.iterrows():
-            verdict = []
-            verdict.append("Growth: Higher" if r.CAGR > b.CAGR else "Growth: Lower")
-            verdict.append("Risk-adjusted: Better" if r.Sharpe > b.Sharpe else "Risk-adjusted: Worse")
-            verdict.append("Drawdown: Shallower" if r.MaxDD > b.MaxDD else "Drawdown: Deeper")
-            verdict.append("Exposure OK" if r.Exposure >= 0.8 else "Low exposure")
-            if r.CAGR > b.CAGR and r.Sharpe > b.Sharpe:
-                action = "Keep/Overweight"
-            elif r.CAGR < b.CAGR and r.Sharpe < b.Sharpe:
-                action = "Trim or shift to ETF"
-            else:
-                action = "Hold / partial trim"
-            out.append({
-                "Ticker": t,
-                "Vs Bench": bench,
-                "Growth": verdict[0],
-                "Risk": verdict[1],
-                "Drawdown": verdict[2],
-                "Exposure": verdict[3],
-                "Suggested Action": action
-            })
-        return pd.DataFrame(out).set_index("Ticker")
-"""
+    
 def interpret_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """
     Interpret metrics vs a benchmark (SPY if present, else highest Sharpe).
