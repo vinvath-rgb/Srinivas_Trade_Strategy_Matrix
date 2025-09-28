@@ -22,7 +22,7 @@ def _auth():
         return  # no auth configured, app is open
     with st.sidebar:
         st.subheader("🔒 App Login")
-        pw = st.text_input("Password", type="password")
+        pw = st.text_input("Password", type="password", key="auth_password")
         if pw != pw_env:
             st.stop()  # halt app until correct password is provided
 
@@ -334,36 +334,36 @@ st.caption("Protected by APP_PASSWORD. Data via yfinance (Stooq fallback). Compa
 
 with st.sidebar:
     st.header("Backtest Settings")
-    tickers = st.text_input("Tickers (comma-separated)", value="AAPL, ACN, SPY, XLK")
-    start = st.date_input("Start", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
-    end   = st.date_input("End", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
+    tickers = st.text_input("Tickers (comma-separated)", value="AAPL, ACN, SPY, XLK", key="sb_tickers")
+    start = st.date_input("Start", value=pd.to_datetime("2015-01-01"), key="sb_start").strftime("%Y-%m-%d")
+    end   = st.date_input("End", value=pd.Timestamp.today(), key="sb_end").strftime("%Y-%m-%d")
 
-    strategy = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion"])
+    strategy = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion"], key="main_strategy")
     c1, c2 = st.columns(2)
     if strategy == "SMA Crossover":
-        fast = c1.number_input("Fast SMA", min_value=2, max_value=200, value=20, step=1)
-        slow = c2.number_input("Slow SMA", min_value=5, max_value=400, value=100, step=5)
+        fast = c1.number_input("Fast SMA", min_value=2, max_value=200, value=20, step=1, key="sb_fast")
+        slow = c2.number_input("Slow SMA", min_value=5, max_value=400, value=100, step=5, key="sb_slow")
         params = {"fast": int(fast), "slow": int(slow)}
     else:
-        rsi_lb = c1.number_input("RSI lookback", min_value=2, max_value=100, value=14, step=1)
-        rsi_buy = c2.number_input("RSI Buy <", min_value=5, max_value=50, value=30, step=1)
-        rsi_sell = st.number_input("RSI Sell >", min_value=50, max_value=95, value=70, step=1)
+        rsi_lb = c1.number_input("RSI lookback", min_value=2, max_value=100, value=14, step=1, key="sb_rsi_lb")
+        rsi_buy = c2.number_input("RSI Buy <", min_value=5, max_value=50, value=30, step=1, key="sb_rsi_buy")
+        rsi_sell = st.number_input("RSI Sell >", min_value=50, max_value=95, value=70, step=1, key="sb_rsi_sell")
         params = {"rsi_lb": int(rsi_lb), "rsi_buy": int(rsi_buy), "rsi_sell": int(rsi_sell)}
 
-    long_only  = st.checkbox("Long-only", value=True)
-    vol_target = st.slider("Vol target (annualized)", 0.05, 0.40, 0.12, 0.01)
-    atr_stop   = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5)
-    tp_mult    = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5)
-    run_btn    = st.button("Run Backtest")
+    long_only  = st.checkbox("Long-only", value=True, key="sb_long_only")
+    vol_target = st.slider("Vol target (annualized)", 0.05, 0.40, 0.12, 0.01, key="sb_vol_target")
+    atr_stop   = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5, key="sb_atr_stop")
+    tp_mult    = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5, key="sb_tp_mult")
+    run_btn    = st.button("Run Backtest", key="btn_run_backtest")
 
 with st.expander("📡 Live Watchlist (near-real-time; small delay)"):
-    wl = st.text_input("Watchlist", value="AAPL, MSFT, SPY")
+    wl = st.text_input("Watchlist", value="AAPL, MSFT, SPY", key="live_wl")
     c1, c2, c3 = st.columns(3)
-    interval = c1.selectbox("Interval", ["1m", "2m", "5m", "15m"], index=0)
-    rsi_lb_w  = c2.number_input("RSI lookback (live)", 5, 50, 14, 1)
-    fast_w    = c3.number_input("Fast SMA (live)", 5, 100, 20, 1)
-    slow_w    = st.number_input("Slow SMA (live)", 20, 400, 100, 5)
-    if st.button("Fetch now"):
+    interval = c1.selectbox("Interval", ["1m", "2m", "5m", "15m"], index=0, key="live_interval")
+    rsi_lb_w  = c2.number_input("RSI lookback (live)", 5, 50, 14, 1, key="live_rsi_lb")
+    fast_w    = c3.number_input("Fast SMA (live)", 5, 100, 20, 1, key="live_fast")
+    slow_w    = st.number_input("Slow SMA (live)", 20, 400, 100, 5, key="live_slow")
+    if st.button("Fetch now", key="btn_live_fetch"):
         tickers_w = [t.strip().upper() for t in wl.split(",") if t.strip()]
         live = fetch_intraday_yf(tickers_w, interval=interval, lookback_days=1)
         rows = []
@@ -388,7 +388,7 @@ with st.expander("📡 Live Watchlist (near-real-time; small delay)"):
 
 with st.expander("🔧 Diagnostics / Cache"):
     st.write("yfinance version:", getattr(yf, "__version__", "unknown"))
-    if st.button("Clear caches"):
+    if st.button("Clear caches", key="btn_clear_cache"):
         load_prices.clear()
         st.success("Cleared cached price downloads.")
 
@@ -408,7 +408,8 @@ if run_btn:
         with tab:
             df = data[t]
             if df is None or df.empty:
-                st.warning(f"No data for {t}"); continue
+                st.warning(f"No data for {t}")
+                continue
             st.write(f"{t}: {len(df)} rows · {df.index.min().date()} → {df.index.max().date()}")
 
             equity, stats = backtest(df, strategy, params, vol_target, long_only, atr_stop, tp_mult)
@@ -448,7 +449,8 @@ if run_btn:
                     st.download_button(
                         f"Download crossover events for {t}",
                         events.to_csv().encode(),
-                        file_name=f"{t}_sma_crossovers.csv"
+                        file_name=f"{t}_sma_crossovers.csv",
+                        key=f"dl_events_{t}"
                     )
 
             st.write("**Stats**:", stats)
@@ -458,7 +460,7 @@ if run_btn:
         res_df = pd.DataFrame(results)
         st.subheader("📋 Summary")
         st.dataframe(res_df, use_container_width=True)
-        st.download_button("Download Results CSV", res_df.to_csv(index=False).encode(), "results_summary.csv")
+        st.download_button("Download Results CSV", res_df.to_csv(index=False).encode(), "results_summary.csv", key="dl_summary")
 
 # =========================
 # Comparator: ACN vs ETFs + Interpretation
@@ -467,26 +469,26 @@ with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
     default_start = "2015-01-01"
     default_end   = pd.Timestamp.today().strftime("%Y-%m-%d")
     c1, c2 = st.columns(2)
-    start_cmp = c1.text_input("Start (YYYY-MM-DD)", value=default_start)
-    end_cmp   = c2.text_input("End (YYYY-MM-DD)", value=default_end)
+    start_cmp = c1.text_input("Start (YYYY-MM-DD)", value=default_start, key="cmp_start")
+    end_cmp   = c2.text_input("End (YYYY-MM-DD)", value=default_end, key="cmp_end")
 
-    universe = st.text_input("Tickers to compare", value="ACN, SPY, XLK, VT")
-    strat = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion"], index=0)
+    universe = st.text_input("Tickers to compare", value="ACN, SPY, XLK, VT", key="cmp_universe")
+    strat = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion"], index=0, key="compare_strategy")
     cc1, cc2, cc3 = st.columns(3)
     if strat == "SMA Crossover":
-        fast_cmp = cc1.number_input("Fast SMA", 2, 200, 20, 1)
-        slow_cmp = cc2.number_input("Slow SMA", 5, 400, 100, 5)
+        fast_cmp = cc1.number_input("Fast SMA", 2, 200, 20, 1, key="cmp_fast")
+        slow_cmp = cc2.number_input("Slow SMA", 5, 400, 100, 5, key="cmp_slow")
         params_cmp = {"fast": int(fast_cmp), "slow": int(slow_cmp)}
     else:
-        rsi_lb_cmp  = cc1.number_input("RSI lookback", 2, 100, 14, 1)
-        rsi_buy_cmp = cc2.number_input("RSI Buy <", 5, 50, 30, 1)
-        rsi_sell_cmp= cc3.number_input("RSI Sell >", 50, 95, 70, 1)
+        rsi_lb_cmp  = cc1.number_input("RSI lookback", 2, 100, 14, 1, key="cmp_rsi_lb")
+        rsi_buy_cmp = cc2.number_input("RSI Buy <", 5, 50, 30, 1, key="cmp_rsi_buy")
+        rsi_sell_cmp= cc3.number_input("RSI Sell >", 50, 95, 70, 1, key="cmp_rsi_sell")
         params_cmp = {"rsi_lb": int(rsi_lb_cmp), "rsi_buy": int(rsi_buy_cmp), "rsi_sell": int(rsi_sell_cmp)}
 
-    long_only_cmp  = st.checkbox("Long-only (ETFs)", value=True)
-    vol_target_cmp = st.slider("Vol target (ann.)", 0.05, 0.40, 0.12, 0.01)
-    atr_stop_cmp   = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5)
-    tp_mult_cmp    = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5)
+    long_only_cmp  = st.checkbox("Long-only (ETFs)", value=True, key="cmp_longonly")
+    vol_target_cmp = st.slider("Vol target (ann.)", 0.05, 0.40, 0.12, 0.01, key="cmp_vol_target")
+    atr_stop_cmp   = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5, key="cmp_atr_stop")
+    tp_mult_cmp    = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5, key="cmp_tp_mult")
 
     def interpret_metrics(df: pd.DataFrame) -> pd.DataFrame:
         bench = "SPY" if "SPY" in df.index else df["Sharpe"].idxmax()
@@ -515,11 +517,12 @@ with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
             })
         return pd.DataFrame(out).set_index("Ticker")
 
-    if st.button("Run comparison"):
+    if st.button("Run comparison", key="btn_run_cmp"):
         tickers_cmp = [t.strip().upper() for t in universe.split(",") if t.strip()]
         data_cmp = load_prices(",".join(tickers_cmp), start_cmp, end_cmp)
         if not data_cmp:
-            st.error("No data downloaded for the selected tickers/range."); st.stop()
+            st.error("No data downloaded for the selected tickers/range.")
+            st.stop()
 
         rows, equities = [], []
         for t in tickers_cmp:
@@ -537,7 +540,8 @@ with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
             equities.append(eq.rename(t) / float(eq.iloc[0]))
 
         if not rows:
-            st.warning("No results to show."); st.stop()
+            st.warning("No results to show.")
+            st.stop()
 
         res = pd.DataFrame(rows).set_index("Ticker").sort_values("CAGR", ascending=False)
         st.subheader("Summary (higher better for CAGR/Sharpe; MaxDD less negative is better)")
@@ -551,4 +555,4 @@ with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
         st.subheader("Interpretation vs Benchmark")
         interp_df = interpret_metrics(res)
         st.dataframe(interp_df, use_container_width=True)
-        st.download_button("Download Interpretation CSV", interp_df.to_csv().encode(), "interpretation.csv")
+        st.download_button("Download Interpretation CSV", interp_df.to_csv().encode(), "interpretation.csv", key="dl_interp")
