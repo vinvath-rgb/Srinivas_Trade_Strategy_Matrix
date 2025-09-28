@@ -1,21 +1,17 @@
 # US-Only Backtester (Srini Edition) — with Password Gate
-# Features:
-# - Password protection via APP_PASSWORD env var
-# - yfinance loader (Stooq fallback)
-# - SMA crossover or RSI mean-reversion
-# - ATR Stop + ATR Take Profit
-# - SMA crossover markers, events table, last-signal badge
-# - Live Watchlist (near-real-time with yfinance intraday)
-# - ACN vs ETFs comparator + interpretation table
+# NOTE: st.set_page_config MUST be the first Streamlit call in the file.
 
 import os
 import time
 import numpy as np
 import pandas as pd
-import streamlit as st
 import yfinance as yf
 from pandas_datareader import data as pdr
 import matplotlib.pyplot as plt
+import streamlit as st
+
+# ✅ MUST be the first Streamlit call
+st.set_page_config(page_title="US Backtester (Srini)", layout="wide")
 
 # ---------------------------
 # 🔒 Password Gate (set APP_PASSWORD in env/secrets)
@@ -30,9 +26,7 @@ def _auth():
         if pw != pw_env:
             st.stop()  # halt app until correct password is provided
 
-_auth()  # call before the rest of the app renders
-
-st.set_page_config(page_title="US Backtester (Srini)", layout="wide")
+_auth()  # call after page_config
 
 # =========================
 # Utilities & Indicators
@@ -52,7 +46,7 @@ def rsi(series: pd.Series, lb: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 def compute_atr(df: pd.DataFrame, lb: int = 14) -> pd.Series:
-    high, low, close = df["High"], df[ "Low"], df[price_col(df)]
+    high, low, close = df["High"], df["Low"], df[price_col(df)]
     prev_close = close.shift(1)
     tr = pd.concat([
         (high - low).abs(),
@@ -153,7 +147,8 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
     else:
         sig = rsi_signals(price, params["rsi_lb"], params["rsi_buy"], params["rsi_sell"])
 
-    if long_only: sig = sig.clip(lower=0.0)
+    if long_only:
+        sig = sig.clip(lower=0.0)
 
     pos = position_sizer(sig, rets, vol_target)
     atr = compute_atr(df, lb=14)
@@ -196,8 +191,8 @@ def compute_sma_cross_events(df: pd.DataFrame, fast: int, slow: int):
 @st.cache_data(show_spinner=False)
 def load_prices(tickers_raw: str, start, end) -> dict:
     tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
-    if not tickers: return {}
-
+    if not tickers:
+        return {}
     start = _to_ts(start)
     end   = _to_ts(end)
     end_inc = end + pd.Timedelta(days=1)
@@ -256,7 +251,8 @@ def load_prices(tickers_raw: str, start, end) -> dict:
 
     cleaned = {}
     for t, df1 in results.items():
-        if df1 is None or df1.empty: continue
+        if df1 is None or df1.empty:
+            continue
         keep = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in df1.columns]
         df1 = df1[keep].sort_index().dropna(how="all")
         if not df1.empty:
