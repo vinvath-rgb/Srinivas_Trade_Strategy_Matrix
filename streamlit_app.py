@@ -1,4 +1,4 @@
-# US-Only Backtester (Srini Edition) — with Password Gate
+# US-Only Backtester (Srini Edition) — with Password Gate and Raw vs Strategy CAGR
 # NOTE: st.set_page_config MUST be the first Streamlit call in the file.
 
 import os
@@ -25,7 +25,6 @@ def _auth():
         pw = st.text_input("Password", type="password", key="auth_password")
         if pw != pw_env:
             st.stop()  # halt app until correct password is provided
-
 _auth()  # call after page_config
 
 # =========================
@@ -163,6 +162,40 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
         "LastEquity": round(float(equity.iloc[-1]) if not equity.empty else 1.0, 4),
     }
     return equity, stats
+
+# --- Buy & Hold CAGR helper (raw, no strategy) ---
+def simple_cagr(df: pd.DataFrame) -> float:
+    px = df[price_col(df)]
+    start_price, end_price = float(px.iloc[0]), float(px.iloc[-1])
+    years = max((df.index[-1] - df.index[0]).days / 365.25, 1e-9)
+    return (end_price / max(start_price, 1e-12)) ** (1 / years) - 1
+
+# --- One-stop evaluation for any ticker (Raw + Strategy) ---
+def evaluate_ticker(
+    df: pd.DataFrame,
+    ticker: str,
+    strategy: str,
+    params: dict,
+    vol_target: float,
+    long_only: bool,
+    atr_stop: float,
+    tp_mult: float,
+):
+    """
+    Runs the strategy backtest *and* computes buy&hold CAGR once.
+    Returns: equity (Series), stats dict including RawCAGR and StrategyCAGR.
+    """
+    equity, stats = backtest(df, strategy, params, vol_target, long_only, atr_stop, tp_mult)
+    raw = simple_cagr(df)
+    stats_out = {
+        "RawCAGR": round(raw, 4),
+        "StrategyCAGR": stats["CAGR"],
+        "Sharpe": stats["Sharpe"],
+        "MaxDD": stats["MaxDD"],
+        "Exposure": stats["Exposure"],
+        "LastEquity": stats["LastEquity"],
+    }
+    return equity, stats_out
 
 # =========================
 # SMA Cross Events (visuals)
@@ -330,7 +363,7 @@ def latest_rsi_sma_status(df, rsi_lb=14, fast=20, slow=100):
 # UI
 # =========================
 st.title("🇺🇸 US Backtester (SMA/RSI + ATR) — Srini")
-st.caption("Protected by APP_PASSWORD. Data via yfinance (Stooq fallback). Compare ACN to ETFs, see SMA cross events, and run a live watchlist.")
+st.caption("Protected by APP_PASSWORD. Data via yfinance (Stooq fallback). Compare Raw vs Strategy, see SMA cross events, and run a live watchlist.")
 
 with st.sidebar:
     st.header("Backtest Settings")
@@ -412,10 +445,22 @@ if run_btn:
                 continue
             st.write(f"{t}: {len(df)} rows · {df.index.min().date()} → {df.index.max().date()}")
 
-            equity, stats = backtest(df, strategy, params, vol_target, long_only, atr_stop, tp_mult)
+            # ✅ unified evaluation (Raw + Strategy)
+            equity, stats = evaluate_ticker(
+                df, t, strategy, params, vol_target, long_only, atr_stop, tp_mult
+            )
 
             st.subheader(f"{t} — Equity Curve")
             st.line_chart(equity, height=320)
+
+            # Show Raw vs Strategy summary
+            st.markdown(
+                f"**Buy & Hold CAGR:** {stats['RawCAGR']:.2%}  |  "
+                f"**Strategy CAGR:** {stats['StrategyCAGR']:.2%}  |  "
+                f"**Sharpe:** {stats['Sharpe']:.2f}  |  "
+                f"**MaxDD:** {stats['MaxDD']:.2%}  |  "
+                f"**Exposure:** {stats['Exposure']:.0%}"
+            )
 
             if strategy == "SMA Crossover":
                 ma_f, ma_s, events = compute_sma_cross_events(df, params["fast"], params["slow"])
@@ -433,11 +478,6 @@ if run_btn:
                 ax.legend(loc="best"); ax.grid(True, alpha=0.3)
                 st.pyplot(fig, clear_figure=True)
 
-                if not events.empty:
-                    last = events.iloc[-1]
-                    stats["LastSignal"] = f"{last['Type']} @ {last.name.date()} ({last['Price']:.2f})"
-                    st.info(f"Last signal: **{last['Type']}** on **{last.name.date()}** at close **{last['Price']:.2f}**")
-
                 st.subheader("SMA Crossover Events")
                 if events.empty:
                     st.write("No crossovers in the selected window.")
@@ -453,17 +493,18 @@ if run_btn:
                         key=f"dl_events_{t}"
                     )
 
-            st.write("**Stats**:", stats)
             results.append({"Ticker": t, **stats})
 
     if results:
-        res_df = pd.DataFrame(results)
-        st.subheader("📋 Summary")
+        res_df = pd.DataFrame(results).set_index("Ticker")
+        res_df["CAGR Δ (Strategy-Raw)"] = (res_df["StrategyCAGR"] - res_df["RawCAGR"]).round(4)
+
+        st.subheader("📋 Summary (Raw vs Strategy)")
         st.dataframe(res_df, use_container_width=True)
-        st.download_button("Download Results CSV", res_df.to_csv(index=False).encode(), "results_summary.csv", key="dl_summary")
+        st.download_button("Download Results CSV", res_df.to_csv().encode(), "results_summary.csv", key="dl_summary")
 
 # =========================
-# Comparator: ACN vs ETFs + Interpretation
+# Comparator: ACN vs ETFs + Interpretation (StrategyCAGR-based)
 # =========================
 with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
     default_start = "2015-01-01"
@@ -490,15 +531,15 @@ with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
     atr_stop_cmp   = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5, key="cmp_atr_stop")
     tp_mult_cmp    = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5, key="cmp_tp_mult")
 
-    # ---------- NEW: improved interpretation ----------
     def interpret_metrics(df: pd.DataFrame) -> pd.DataFrame:
         """
-        Interpret metrics vs a benchmark (SPY if present, else highest Sharpe).
-        Handles self-comparison cleanly and uses tolerance for near-equality.
+        Interpret metrics vs a benchmark (SPY if present, else highest StrategyCAGR Sharpe tie-break).
+        Uses StrategyCAGR for 'Growth' comparisons. Handles self-comparison and tolerance for near-equality.
         """
         if df.empty:
             return pd.DataFrame()
 
+        # pick benchmark
         bench = "SPY" if "SPY" in df.index else df["Sharpe"].idxmax()
         b = df.loc[bench]
         eps_cagr, eps_sharpe, eps_dd = 1e-4, 1e-2, 1e-4
@@ -523,10 +564,10 @@ with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
                 })
                 continue
 
-            # Growth (CAGR)
-            if r.CAGR > b.CAGR + eps_cagr:   growth = "Growth: Higher"
-            elif r.CAGR < b.CAGR - eps_cagr: growth = "Growth: Lower"
-            else:                             growth = "Growth: ~Equal"
+            # Growth comparison uses StrategyCAGR
+            if r.StrategyCAGR > b.StrategyCAGR + eps_cagr:   growth = "Growth: Higher"
+            elif r.StrategyCAGR < b.StrategyCAGR - eps_cagr: growth = "Growth: Lower"
+            else:                                             growth = "Growth: ~Equal"
 
             # Risk-adjusted (Sharpe)
             if r.Sharpe > b.Sharpe + eps_sharpe:   risk = "Risk-adjusted: Better"
@@ -556,7 +597,6 @@ with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
             })
 
         return pd.DataFrame(rows).set_index("Ticker")
-    # ---------- end NEW ----------
 
     if st.button("Run comparison", key="btn_run_cmp"):
         tickers_cmp = [t.strip().upper() for t in universe.split(",") if t.strip()]
@@ -570,8 +610,8 @@ with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
             df = data_cmp.get(t)
             if df is None or df.empty:
                 continue
-            eq, stats = backtest(
-                df, strat, params_cmp,
+            eq, stats = evaluate_ticker(
+                df, t, strat, params_cmp,
                 vol_target=vol_target_cmp,
                 long_only=long_only_cmp,
                 atr_stop=atr_stop_cmp,
@@ -584,8 +624,10 @@ with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
             st.warning("No results to show.")
             st.stop()
 
-        res = pd.DataFrame(rows).set_index("Ticker").sort_values("CAGR", ascending=False)
-        st.subheader("Summary (higher better for CAGR/Sharpe; MaxDD less negative is better)")
+        res = pd.DataFrame(rows).set_index("Ticker").sort_values("StrategyCAGR", ascending=False)
+        res["CAGR Δ (Strategy-Raw)"] = (res["StrategyCAGR"] - res["RawCAGR"]).round(4)
+
+        st.subheader("Summary (Strategy vs Raw)")
         st.dataframe(res, use_container_width=True)
 
         if equities:
@@ -593,8 +635,7 @@ with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
             st.subheader("Normalized Equity Curves (start = 1.0)")
             st.line_chart(combined, height=360)
 
-        # ✅ Build and SHOW interpretation table
-        st.subheader("Interpretation vs Benchmark")
+        st.subheader("Interpretation vs Benchmark (based on StrategyCAGR)")
         interp_df = interpret_metrics(res)
         st.dataframe(interp_df, use_container_width=True)
         st.download_button("Download Interpretation CSV", interp_df.to_csv().encode(),
