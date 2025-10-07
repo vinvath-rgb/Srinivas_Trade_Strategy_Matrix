@@ -133,7 +133,7 @@ def metrics_from_returns(r: pd.Series) -> dict:
     years = len(r) / PDAYS
     cagr = curve.iloc[-1] ** (1 / years) - 1.0 if years > 0 else 0.0
 
-    # vol & sharpe (mean/vol * sqrt(252))
+    # vol & sharpe
     vol = r.std() * np.sqrt(PDAYS)
     mean = r.mean()
     sharpe = (mean / r.std() * np.sqrt(PDAYS)) if r.std() > 0 else 0.0
@@ -141,11 +141,10 @@ def metrics_from_returns(r: pd.Series) -> dict:
     # drawdown
     mdd = max_drawdown(curve)
 
-    # win rate & trades (naive: positive-return days = wins)
+    # win rate
     wins = (r > 0).sum()
     win_rate = wins / len(r)
 
-    # crude trades via position changes will be filled elsewhere
     return dict(
         total_return=total_ret,
         cagr=cagr,
@@ -153,7 +152,7 @@ def metrics_from_returns(r: pd.Series) -> dict:
         sharpe=sharpe,
         max_dd=mdd,
         win_rate=win_rate,
-        trades=np.nan,  # to be filled optionally
+        trades=np.nan,  # filled later
     )
 
 def compute_turnover(pos: pd.Series) -> float:
@@ -211,10 +210,9 @@ def run_matrix(
         systems = {"reg_mean": reg_mean, "reg_median": reg_median}
         for system, reg in systems.items():
             for regime_val in [0, 1, 2]:
-                mask = (reg == regime_val)
-                if mask.sum() == 0:
+                idx = reg.index[reg == regime_val]
+                if len(idx) == 0:
                     continue
-                idx = mask[mask].index
 
                 # TREND
                 r_tr = (pos_trend.loc[idx] * ret_shift.loc[idx]).dropna()
