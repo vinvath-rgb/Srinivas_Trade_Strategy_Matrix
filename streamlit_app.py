@@ -2,9 +2,8 @@
 import os
 import streamlit as st
 from regime_matrix_app.Streamlit_Regime_App import main as app_main
-# or: from regime_matrix_app.strategy_regime_matrix_app import main as app_main
 
-st.set_page_config(page_title="US BackTester (Srini)", layout="wide")
+st.set_page_config(page_title="Strategy–Regime Matrix (Srini)", layout="wide")
 
 def _auth():
     pw_env = os.getenv("APP_PASSWORD", "")
