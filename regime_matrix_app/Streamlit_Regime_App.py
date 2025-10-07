@@ -84,3 +84,10 @@ if run_btn:
     matrix.to_csv(buf, index=False)
     st.download_button("⬇️ Download matrix_results.csv", data=buf.getvalue(),
                        file_name="matrix_results.csv", mime="text/csv")
+def main():
+    # call your existing Streamlit UI logic here
+    # if everything is already running at top-level, just leave it empty
+    pass
+
+if __name__ == "__main__":
+    main()
