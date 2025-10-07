@@ -2,7 +2,7 @@ import io
 import pandas as pd
 import numpy as np
 import streamlit as st
-from strategy_regime_matrix import run_matrix, _to_long  # import from the script
+from regime_matrix_app.strategy_regime_matrix_app import run_matrix, _to_long  # import from the script
 
 st.set_page_config(page_title="Strategy–Regime Matrix", layout="wide")
 st.title("📈 Strategy–Regime Matrix (Mean & Median Regimes)")
