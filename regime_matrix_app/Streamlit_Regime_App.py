@@ -4,7 +4,8 @@ import numpy as np
 import streamlit as st
 from regime_matrix_app.strategy_regime_matrix_app import run_matrix, _to_long
 
-st.set_page_config(page_title="Strategy–Regime Matrix", layout="wide")
+# IMPORTANT: Do NOT call st.set_page_config() here.
+# It's already called once in streamlit_app.py
 
 def _number_input(label, value, min_value=None, max_value=None, step=None, help=None):
     return st.number_input(label, value=value, min_value=min_value, max_value=max_value, step=step, help=help)
@@ -31,7 +32,7 @@ def main():
         **Workflow**
         1. Upload CSV  
         2. Set parameters (or keep defaults)  
-        3. Click **Run** → Computes metrics per (system, ticker, regime, strategy)  
+        3. Click **Run** → Computes metrics per (system, ticker, regime, strategy)
         """)
 
     upload = st.file_uploader("Upload CSV (long or wide)", type=["csv"])
