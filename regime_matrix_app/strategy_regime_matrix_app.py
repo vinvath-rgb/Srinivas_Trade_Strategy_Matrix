@@ -42,7 +42,32 @@ def _eqw_portfolio(tickers: List[str], start: str | None, end: str | None) -> pd
     mat = pd.concat(frames, axis=1).dropna(how="all")
     mat.columns = pd.MultiIndex.from_product([["Close"], list(mat.columns)])
     return mat
+    
+def _signals_to_positions(reg_df: pd.DataFrame, action: str) -> pd.Series:
+    # Map labels to numbers and make it float-safe
+    sig = (
+        reg_df["regime_composite"]
+        .replace({"UP": 1, "DOWN": -1, "NEUTRAL": 0, "BULL": 1, "BEAR": -1})
+        .pipe(pd.to_numeric, errors="coerce")
+        .reindex(reg_df.index)
+        .fillna(0.0)
+    )
 
+    if action == "short_05":
+        # Long +1 on UP, short -0.5 otherwise (half sized short)
+        pos = sig.where(sig == 1, -0.5)
+    elif action == "long_only":
+        # Long 1 on UP, 0 otherwise
+        pos = sig.clip(lower=0.0)
+    elif action == "cash_on_down":
+        # 1 on UP, 0 on DOWN (no short)
+        pos = sig.mask(sig < 0, 0.0)
+    else:
+        # default: use the raw -1/0/1 signal
+        pos = sig
+
+    return pos.astype(float)
+    
 # def _signals_to_positions(reg_df: pd.DataFrame, action: str) -> pd.Series:
    # sig = reg_df["regime_composite"].reindex(reg_df.index).fillna(0)
    # if action == "short_05":
