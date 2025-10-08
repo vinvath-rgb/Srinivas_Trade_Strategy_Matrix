@@ -2,7 +2,13 @@ import io
 import pandas as pd
 import numpy as np
 import streamlit as st
-from regime_matrix_app.strategy_regime_matrix_app import main as app_main
+
+# ✅ Import the actual compute function
+try:
+    from regime_matrix_app.strategy_regime_matrix_app import run_matrix
+except Exception as e:
+    run_matrix = None
+    _IMPORT_ERR = e
 
 # IMPORTANT: Do NOT call st.set_page_config() here.
 # It's already called once in streamlit_app.py
@@ -19,6 +25,62 @@ def _read_csv(upload) -> pd.DataFrame:
         upload.seek(0)
         df = pd.read_csv(upload, encoding_errors="ignore")
     return df
+
+# ✅ Robust LONG/WIDE normalizer
+def _to_long(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        raise ValueError("Empty CSV")
+
+    # Normalize/guess the date column name
+    date_col = None
+    for cand in ["Date", "date", "DATE", "timestamp", "Timestamp", "datetime", "Datetime"]:
+        if cand in df.columns:
+            date_col = cand
+            break
+    if date_col is None:
+        raise ValueError("No Date column found. Expected a column named 'Date' (case sensitive).")
+
+    df = df.copy()
+    df.rename(columns={date_col: "Date"}, inplace=True)
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"])
+
+    cols = [c for c in df.columns if c != "Date"]
+
+    # LONG format: has Ticker & Close (case-flex)
+    has_ticker = any(c.lower() == "ticker" for c in cols)
+    has_close = any(c.lower() == "close" for c in cols)
+
+    if has_ticker and has_close:
+        # Standardize exact names
+        rename_map = {}
+        for c in cols:
+            if c.lower() == "ticker":
+                rename_map[c] = "Ticker"
+            if c.lower() == "close":
+                rename_map[c] = "Close"
+        df.rename(columns=rename_map, inplace=True)
+        out = df[["Date", "Ticker", "Close"]].copy()
+        out["Ticker"] = out["Ticker"].astype(str)
+        out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
+        out = out.dropna(subset=["Close"])
+        return out.sort_values(["Ticker", "Date"]).reset_index(drop=True)
+
+    # WIDE format: Date + one column per ticker of close prices
+    # Melt to long
+    wide_cols = [c for c in cols if str(c).strip() != ""]
+    if not wide_cols:
+        raise ValueError("No price columns found besides 'Date'.")
+
+    long_df = pd.melt(df, id_vars=["Date"], value_vars=wide_cols,
+                      var_name="Ticker", value_name="Close")
+    long_df["Ticker"] = long_df["Ticker"].astype(str)
+    long_df["Close"] = pd.to_numeric(long_df["Close"], errors="coerce")
+    long_df = long_df.dropna(subset=["Close"])
+    return long_df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
+
+# ✅ Back-compat alias so any stray 'to_long' calls won't break
+to_long = _to_long
 
 def main():
     st.title("📈 Strategy–Regime Matrix (Mean & Median Regimes)")
@@ -72,6 +134,14 @@ def main():
             st.error(f"Could not parse CSV: {e}")
             st.stop()
 
+        if run_matrix is None:
+            st.error(
+                "Compute function 'run_matrix' could not be imported from "
+                "`regime_matrix_app.strategy_regime_matrix_app`. "
+                f"Import error: {_IMPORT_ERR}"
+            )
+            st.stop()
+
         with st.spinner("Computing matrix..."):
             matrix = run_matrix(
                 df_long,
@@ -84,7 +154,7 @@ def main():
                 boll_k=boll_k,
             )
 
-        if matrix.empty:
+        if matrix is None or matrix.empty:
             st.warning("No rows produced. Check your data and parameters.")
             st.stop()
 
