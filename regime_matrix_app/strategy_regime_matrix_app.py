@@ -43,13 +43,13 @@ def _eqw_portfolio(tickers: List[str], start: str | None, end: str | None) -> pd
     mat.columns = pd.MultiIndex.from_product([["Close"], list(mat.columns)])
     return mat
 
-def _signals_to_positions(reg_df: pd.DataFrame, action: str) -> pd.Series:
-    sig = reg_df["regime_composite"].reindex(reg_df.index).fillna(0)
-    if action == "short_05":
-        pos = sig.where(sig == 1, -0.5)
-    else:
-        pos = sig
-    return pos.astype(float)
+# def _signals_to_positions(reg_df: pd.DataFrame, action: str) -> pd.Series:
+   # sig = reg_df["regime_composite"].reindex(reg_df.index).fillna(0)
+   # if action == "short_05":
+    #    pos = sig.where(sig == 1, -0.5)
+    #else:
+     #   pos = sig
+    #return pos.astype(float)
 
 def _backtest_close(close: pd.Series, positions: pd.Series) -> pd.DataFrame:
     ret = close.pct_change().fillna(0.0)
