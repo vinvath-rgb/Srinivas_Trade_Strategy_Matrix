@@ -2,7 +2,7 @@ import io
 import pandas as pd
 import numpy as np
 import streamlit as st
-from regime_matrix_app.strategy_regime_matrix_app import run_matrix, _to_long
+from regime_matrix_app.strategy_regime_matrix_app import main as app_main
 
 # IMPORTANT: Do NOT call st.set_page_config() here.
 # It's already called once in streamlit_app.py
