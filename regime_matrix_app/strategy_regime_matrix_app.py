@@ -1,172 +1,62 @@
-import yfinance as yf
+from __future__ import annotations
 import pandas as pd
 import numpy as np
-import streamlit as st
-from dataclasses import dataclass
-from typing import List
+import matplotlib.pyplot as plt
+from typing import List, Optional, Tuple
 
-from regime_matrix_app.data_utils import read_prices_upload
-from regime_matrix_app.regime_detector_module import apply_regime_logic
+from regime_matrix_app.data_utils import fetch_prices_for_tickers, eq_weight_portfolio
+from regime_matrix_app.regime_detector_module import compute_regimes
 
-@dataclass
-class Params:
-    fast_sma: int = 10
-    slow_sma: int = 40
-    vol_window: int = 20
-    rsi_window: int = 14
-    k_mean: float = 1.0
-    k_median: float = 1.0
-    combine_method: str = "majority"
-    downtrend_action: str = "cash"  # or "short_05"
 
-def _fetch_yf(ticker: str, start: str | None, end: str | None) -> pd.DataFrame:
-    kwargs = {}
-    if start:
-        kwargs["start"] = start
-    if end:
-        kwargs["end"] = end
-    df = yf.download(ticker, **kwargs)
-    if df.empty:
-        raise ValueError(f"No data from Yahoo for {ticker}")
-    df.index.name = "Date"
-    return df
+DefFig = Tuple[plt.Figure, Optional[pd.DataFrame], str]
 
-def _eqw_portfolio(tickers: List[str], start: str | None, end: str | None) -> pd.DataFrame:
-    frames = []
-    for t in tickers:
-        d = _fetch_yf(t.strip(), start, end)
-        d = d[["Close"]].rename(columns={"Close": t.strip()})
-        frames.append(d)
-    if not frames:
-        raise ValueError("No tickers provided")
-    mat = pd.concat(frames, axis=1).dropna(how="all")
-    mat.columns = pd.MultiIndex.from_product([["Close"], list(mat.columns)])
-    return mat
-    
-def _signals_to_positions(reg_df: pd.DataFrame, action: str) -> pd.Series:
-    # Map labels to numbers and make it float-safe
-    sig = (
-        reg_df["regime_composite"]
-        .replace({"UP": 1, "DOWN": -1, "NEUTRAL": 0, "BULL": 1, "BEAR": -1})
-        .pipe(pd.to_numeric, errors="coerce")
-        .reindex(reg_df.index)
-        .fillna(0.0)
-    )
 
-    if action == "short_05":
-        # Long +1 on UP, short -0.5 otherwise (half sized short)
-        pos = sig.where(sig == 1, -0.5)
-    elif action == "long_only":
-        # Long 1 on UP, 0 otherwise
-        pos = sig.clip(lower=0.0)
-    elif action == "cash_on_down":
-        # 1 on UP, 0 on DOWN (no short)
-        pos = sig.mask(sig < 0, 0.0)
-    else:
-        # default: use the raw -1/0/1 signal
-        pos = sig
+def _to_datetime(x):
+    return None if x in (None, "", "None") else pd.to_datetime(x)
 
-    return pos.astype(float)
-    
-# def _signals_to_positions(reg_df: pd.DataFrame, action: str) -> pd.Series:
-   # sig = reg_df["regime_composite"].reindex(reg_df.index).fillna(0)
-   # if action == "short_05":
-    #    pos = sig.where(sig == 1, -0.5)
-    #else:
-     #   pos = sig
-    #return pos.astype(float)
 
-def _backtest_close(close: pd.Series, positions: pd.Series) -> pd.DataFrame:
-    ret = close.pct_change().fillna(0.0)
-    strat_ret = positions.shift(1).fillna(0.0) * ret  # enter next day
-    eq_curve = (1 + strat_ret).cumprod()
-    bh_curve = (1 + ret).cumprod()
-    return pd.DataFrame({"strategy": eq_curve, "buy_hold": bh_curve})
+def run_matrix(tickers: List[str], df_csv: pd.DataFrame, start=None, end=None, logger=None) -> DefFig:
+    start = _to_datetime(start)
+    end = _to_datetime(end)
 
-def _metrics(equity: pd.Series) -> dict:
-    total = equity.iloc[-1] - 1 if len(equity) else np.nan
-    daily = equity.pct_change().dropna()
-    sharpe = (daily.mean() / (daily.std() + 1e-12)) * np.sqrt(252) if len(daily) else np.nan
-    dd = (equity / equity.cummax() - 1.0).min() if len(equity) else np.nan
-    return {"Total Return": float(total), "Sharpe": float(sharpe), "Max Drawdown": float(dd)}
-
-def main():
-    # Sidebar: parameters
-    with st.sidebar:
-        st.caption("Risk-on/off from SMA + Vol + RSI. Majority vote. Downtrend action: Cash or Short.")
-        p = Params()
-        p.fast_sma = st.number_input("Fast SMA", 5, 200, value=10)
-        p.slow_sma = st.number_input("Slow SMA", 10, 400, value=40)
-        p.vol_window = st.number_input("Vol Window", 5, 400, value=20)
-        p.rsi_window = st.number_input("RSI Window", 5, 60, value=14)
-        p.k_mean = st.number_input("k (mean)", 0.1, 5.0, value=1.0, step=0.1)
-        p.k_median = st.number_input("k (median)", 0.1, 5.0, value=1.0, step=0.1)
-        p.combine_method = st.selectbox("Combine Method", ["majority"], index=0)
-        p.downtrend_action = st.selectbox("Downtrend Action", ["cash", "short_05"], index=0)
-
-    st.subheader("Run Single Ticker Test")
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col1:
-        ticker = st.text_input("Ticker (Yahoo Finance)", value="AAPL")
-    with col2:
-        start = st.text_input("Start Date", value="2020-01-01")
-    with col3:
-        end = st.text_input("End Date (optional)")
-
-    st.subheader("Upload Custom CSV (optional)")
-    up = st.file_uploader("Upload prices CSV (LONG or WIDE)", type=["csv"])
-
-    st.subheader("Portfolio Backtest (equal-weight)")
-    ptickers = st.text_input("Tickers (comma-separated)", value="AAPL,MSFT,SPY")
-    pstart = st.text_input("Portfolio Start Date", value="2020-01-01")
-    pend = st.text_input("Portfolio End Date (optional)")
-
-    run = st.button("Run Regime Backtest")
-    if not run:
-        return
-
-    try:
-        if up is not None:
-            prices = read_prices_upload(up)
-            preferred = ticker.strip() if ticker else None
+    # 1) Build prices DataFrame either from CSV or Yahoo
+    if not df_csv.empty:
+        # normalize CSV
+        if set(map(str.lower, df_csv.columns)) >= {"date", "ticker", "close"}:
+            # LONG → pivot to WIDE
+            df_csv["Date"] = pd.to_datetime(df_csv["Date"])  # type: ignore
+            wide = df_csv.pivot_table(index="Date", columns="Ticker", values="Close")
         else:
-            if ptickers.strip():
-                tks = [t.strip() for t in ptickers.split(",") if t.strip()]
-                prices = _eqw_portfolio(tks, pstart or None, pend or None)
-                preferred = ticker.strip() if ticker else (tks[0] if tks else None)
-            else:
-                df = _fetch_yf(ticker.strip(), start or None, end or None)
-                prices = df
-                preferred = None
+            # Assume WIDE already
+            wide = df_csv.copy()
+            wide["Date"] = pd.to_datetime(wide["Date"])  # type: ignore
+            wide = wide.set_index("Date").sort_index()
+        prices = wide.dropna(how="all")
+        used = list(prices.columns)
+        msg = f"Used {len(used)} tickers from CSV: {', '.join(used[:15])}{' …' if len(used)>15 else ''}"
+    else:
+        prices = fetch_prices_for_tickers(tickers, start=start, end=end, logger=logger)
+        used = tickers
+        msg = f"Fetched prices for: {', '.join(used)}"
 
-        reg = apply_regime_logic(
-            prices,
-            fast_sma=p.fast_sma,
-            slow_sma=p.slow_sma,
-            vol_window=p.vol_window,
-            rsi_window=p.rsi_window,
-            k_mean=p.k_mean,
-            k_median=p.k_median,
-            preferred=preferred,
-        )
+    if prices.empty:
+        raise ValueError("No price data after loading.")
 
-        pos = _signals_to_positions(reg, action=p.downtrend_action)
-        eq = _backtest_close(reg["Close"], positions=pos)
+    # 2) Equal‑weight portfolio
+    port = eq_weight_portfolio(prices)
 
-        st.line_chart(eq)
-        st.line_chart(reg[["Close", "SMA_fast", "SMA_slow"]].dropna())
+    # 3) Compute regimes
+    reg_df = compute_regimes(port)
 
-        m1 = _metrics(eq["strategy"]) if not eq.empty else {"Total Return": float("nan"), "Sharpe": float("nan"), "Max Drawdown": float("nan")}
-        m2 = _metrics(eq["buy_hold"]) if not eq.empty else {"Total Return": float("nan"), "Sharpe": float("nan"), "Max Drawdown": float("nan")}
+    # 4) Heatmap-like simple table (Mean/Median flags)
+    heat = reg_df[["Regime_Mean", "Regime_Median"]].tail(60)
 
-        st.markdown("### Performance")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.write("**Strategy**", m1)
-        with c2:
-            st.write("**Buy & Hold**", m2)
+    # 5) Plot
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.gca()
+    ax.plot(port.index, port, label="EQW Portfolio")
+    ax.set_title("Equal‑Weight Portfolio with Regimes (last 1Y)")
+    ax.legend()
+    fig.autofmt_xdate()
 
-        st.success("Done.")
-    except Exception as e:
-        st.error(f"Run failed: {e}")
-        st.exception(e)
+    return fig, heat, msg
