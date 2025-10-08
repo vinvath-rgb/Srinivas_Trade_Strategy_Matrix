@@ -50,6 +50,9 @@ def apply_regime_logic(
     # Simple trend regime
     out["regime_trend"] = np.where(out["SMA_fast"] > out["SMA_slow"], "UP", "DOWN")
 
+    # composite regime placeholder
+    out["regime_composite"] = out["regime_trend"]
+
     # Optionally remember the preferred symbol column if the caller uses it
     if preferred is not None:
         out.attrs["preferred"] = preferred
