@@ -5,8 +5,8 @@ import streamlit as st
 # MUST be the first Streamlit call in the whole app
 st.set_page_config(page_title="Strategy–Regime Matrix (Srini)", layout="wide")
 
-from regime_matrix_app.Streamlit_Regime_App import main as app_main  # import AFTER set_page_config
-
+from regime_matrix_app.strategy_regime_matrix_app import main as app_main
+# import AFTER set_page_config
 def _auth():
     pw_env = os.getenv("APP_PASSWORD", "")
     if not pw_env:
