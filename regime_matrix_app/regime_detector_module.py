@@ -1,4 +1,4 @@
-l# regime_matrix_app/regime_detector_module.py
+# regime_matrix_app/regime_detector_module.py
 import pandas as pd
 import numpy as np
 
