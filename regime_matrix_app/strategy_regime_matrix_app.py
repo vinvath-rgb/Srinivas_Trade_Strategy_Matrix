@@ -5,8 +5,8 @@ import streamlit as st
 from dataclasses import dataclass
 from typing import List
 
-from .data_utils import read_prices_upload
-from .regime_detector_module import apply_regime_logic
+from regime_matrix_app.data_utils import read_prices_upload
+from regime_matrix_app.regime_detector_module import apply_regime_logic
 
 @dataclass
 class Params:
