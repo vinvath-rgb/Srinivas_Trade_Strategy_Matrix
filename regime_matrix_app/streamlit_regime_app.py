@@ -5,7 +5,7 @@ import streamlit as st
 
 # ✅ Import the actual compute function
 try:
-    from regime_matrix_app.strategy_regime_matrix_app import run_matrix
+    from regime_matrix_app.strategy_regime_matrix_app import main as run_matrix
 except Exception as e:
     run_matrix = None
     _IMPORT_ERR = e
