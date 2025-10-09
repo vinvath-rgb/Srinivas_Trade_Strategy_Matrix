@@ -55,7 +55,8 @@ def run_matrix(tickers: List[str], df_csv: pd.DataFrame, start=None, end=None, l
     fig = plt.figure(figsize=(10, 5))
     ax = fig.gca()
     ax.plot(port.index, port, label="EQW Portfolio")
-    ax.set_title("Equal‑Weight Portfolio (variable‑weight)")")
+   # ax.set_title("Equal‑Weight Portfolio (variable‑weight)")")
+    ax.set_title("Equal-Weight Portfolio (variable-weight)")
     ax.legend()
     fig.autofmt_xdate()
 
