@@ -56,3 +56,4 @@ def main():
                         st.pyplot(fig)
             except Exception as e:
                 st.error(f"Run failed: {e}")
+                
