@@ -53,7 +53,6 @@ def fetch_prices_for_tickers(tickers: List[str], start=None, end=None, logger=No
     if not tickers:
         raise ValueError("No tickers provided")
 
-    # Sanity on dates
     if end is not None:
         end = pd.to_datetime(end)
         if end > pd.Timestamp.today():
@@ -75,14 +74,17 @@ def fetch_prices_for_tickers(tickers: List[str], start=None, end=None, logger=No
             raise ValueError(f"No data from Yahoo for {t}")
         frames.append(df[["Close"]].rename(columns={"Close": t}))
 
-    prices = pd.concat(frames, axis=1).dropna(how="all").dropna()
+    # IMPORTANT: keep union of dates; only drop rows where *all* tickers are NaN.
+    prices = pd.concat(frames, axis=1).sort_index().dropna(how="all")
     return prices
 
 
 def eq_weight_portfolio(prices: pd.DataFrame) -> pd.Series:
-    # Convert to equal‑weight index starting at 100
-    ret = prices.pct_change().dropna()
-    w = np.repeat(1.0 / ret.shape[1], ret.shape[1])
-    port_ret = (ret * w).sum(axis=1)
-    idx = (1 + port_ret).cumprod() * 100.0
+    """Equal‑weight portfolio index using variable weights per day.
+    If a ticker is missing on a given day, average the returns of available tickers.
+    This avoids shrinking the history to the intersection of all series."""
+    ret = prices.pct_change()
+    # Mean across columns, skipping NaNs → variable-weight equal average
+    port_ret = ret.mean(axis=1, skipna=True)
+    idx = (1 + port_ret.fillna(0)).cumprod() * 100.0
     return idx
