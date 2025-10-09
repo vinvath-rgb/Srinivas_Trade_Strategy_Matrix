@@ -1,93 +1,129 @@
-from __future__ import annotations
 import time
-from typing import List, Optional
 import pandas as pd
-import numpy as np
 import yfinance as yf
+from pandas_datareader import data as pdr
 
-# Optional fallback (Stooq)
-try:
-    from pandas_datareader import data as pdr
-except Exception:  # pragma: no cover
-    pdr = None
+# =====================================================
+# 🧩 Helper: Normalize OHLC Columns
+# Ensures consistent 'Close' column and clean index
+# =====================================================
+def _normalize_ohlc_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
 
+    # Title-case keeps 'Adj Close' intact
+    df = df.rename(columns=lambda c: str(c).strip().title())
 
-def _log(logger, text):
-    if logger is None:
-        return
-    try:
-        logger.info(text)
-    except Exception:
+    # If only adjusted close is present, rename it
+    if "Adj Close" in df.columns and "Close" not in df.columns:
+        df = df.rename(columns={"Adj Close": "Close"})
+
+    # Remove duplicate columns if any
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    # Normalize index
+    if isinstance(df.index, pd.DatetimeIndex):
         try:
-            logger.write(text)
+            df.index = df.index.tz_localize(None)
         except Exception:
             pass
+        df = df.sort_index()
+
+    return df
 
 
+# =====================================================
+# 🧩 Safe Yahoo Download with retries & normalization
+# =====================================================
 def _safe_download(ticker: str, start=None, end=None) -> pd.DataFrame:
     """Robust Yahoo fetch with retries and fallback period."""
     for attempt in range(3):
-        df = yf.download(ticker, start=start, end=end, progress=False)
-        df = df.rename(columns=lambda c: c.capitalize())  # ensures 'Close' not 'close'
-    if "Adj Close" in df.columns and "Close" not in df.columns:
-        df = df.rename(columns={"Adj Close": "Close"})
-        if not df.empty:
-            return df
-        # try with a period fallback
-        df = yf.download(ticker, period="12mo", progress=False)
-        if not df.empty:
-            return df
+        try:
+            df = yf.download(ticker, start=start, end=end, progress=False)
+            df = _normalize_ohlc_columns(df)
+            if not df.empty:
+                return df
+
+            # fallback: 12mo if date range fails
+            df = yf.download(ticker, period="12mo", progress=False)
+            df = _normalize_ohlc_columns(df)
+            if not df.empty:
+                return df
+
+        except Exception:
+            pass
+
         time.sleep(0.8 * (attempt + 1))
+
     return pd.DataFrame()
 
 
+# =====================================================
+# 🧩 Fallback to Stooq
+# =====================================================
 def _fallback_stooq(ticker: str) -> pd.DataFrame:
-    if pdr is None:
-        return pd.DataFrame()
+    """Try Stooq as backup if Yahoo fails."""
     try:
         df = pdr.DataReader(ticker, "stooq")
         df = df.sort_index()
+        df = _normalize_ohlc_columns(df)
         return df
     except Exception:
         return pd.DataFrame()
 
 
-def fetch_prices_for_tickers(tickers: List[str], start=None, end=None, logger=None) -> pd.DataFrame:
-    if not tickers:
-        raise ValueError("No tickers provided")
-
-    if end is not None:
-        end = pd.to_datetime(end)
-        if end > pd.Timestamp.today():
-            end = pd.Timestamp.today()
-    if start is not None:
-        start = pd.to_datetime(start)
-
-    frames = []
-    for t in tickers:
-        t = t.strip().upper()
-        if not t:
+# =====================================================
+# 🧩 Unified Fetch Function
+# =====================================================
+def fetch_prices_for_tickers(tickers, start=None, end=None, logger=None) -> dict:
+    """
+    Fetch prices for a list of tickers, trying Yahoo first then Stooq fallback.
+    Returns a dict {ticker: DataFrame} each with a 'Close' column.
+    """
+    results = {}
+    for tkr in tickers:
+        tkr = tkr.strip().upper()
+        if not tkr:
             continue
-        _log(logger, f"Fetching {t} from Yahoo…")
-        df = _safe_download(t, start=start, end=end)
+
+        if logger:
+            try:
+                logger.info(f"Fetching {tkr}")
+            except Exception:
+                pass
+
+        df = _safe_download(tkr, start=start, end=end)
+
         if df.empty:
-            _log(logger, f"Yahoo failed for {t}; trying Stooq fallback…")
-            df = _fallback_stooq(t)
-        if df.empty:
-            raise ValueError(f"No data from Yahoo for {t}")
-        frames.append(df[["Close"]].rename(columns={"Close": t}))
+            if logger:
+                try:
+                    logger.info(f"Yahoo failed for {tkr}; trying Stooq fallback.")
+                except Exception:
+                    pass
+            df = _fallback_stooq(tkr)
+            if not df.empty:
+                df.attrs["source"] = "stooq"
+            else:
+                df.attrs["source"] = "none"
+        else:
+            df.attrs["source"] = "yahoo"
 
-    # IMPORTANT: keep union of dates; only drop rows where *all* tickers are NaN.
-    prices = pd.concat(frames, axis=1).sort_index().dropna(how="all")
-    return prices
+        results[tkr] = df
+
+    return results
 
 
-def eq_weight_portfolio(prices: pd.DataFrame) -> pd.Series:
-    """Equal‑weight portfolio index using variable weights per day.
-    If a ticker is missing on a given day, average the returns of available tickers.
-    This avoids shrinking the history to the intersection of all series."""
-    ret = prices.pct_change()
-    # Mean across columns, skipping NaNs → variable-weight equal average
-    port_ret = ret.mean(axis=1, skipna=True)
-    idx = (1 + port_ret.fillna(0)).cumprod() * 100.0
-    return idx
+# =====================================================
+# 🧩 Equal-weight Portfolio Helper (Legacy)
+# =====================================================
+def eq_weight_portfolio(close_wide: pd.DataFrame) -> pd.Series:
+    """Simple equal-weighted portfolio from a wide Close dataframe."""
+    if close_wide.empty:
+        return pd.Series(dtype=float)
+
+    cl = close_wide.sort_index().dropna(how="any")
+    ret = cl.pct_change()
+    w = pd.DataFrame(1.0 / cl.shape[1], index=cl.index, columns=cl.columns)
+    port_ret = (w * ret).sum(axis=1).fillna(0.0)
+    eqw_curve = (1.0 + port_ret).cumprod() * 100.0
+    return eqw_curve
