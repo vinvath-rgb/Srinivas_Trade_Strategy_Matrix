@@ -31,3 +31,4 @@ def compute_regimes(price: pd.Series, fast_sma: int = 10, slow_sma: int = 40,
     df["Bull"] = (df["SMA_fast"] > df["SMA_slow"]).astype(int)
 
     return df
+    
