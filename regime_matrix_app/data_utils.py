@@ -28,6 +28,7 @@ def _safe_download(ticker: str, start=None, end=None) -> pd.DataFrame:
     """Robust Yahoo fetch with retries and fallback period."""
     for attempt in range(3):
         df = yf.download(ticker, start=start, end=end, progress=False)
+        
         if not df.empty:
             return df
         # try with a period fallback
