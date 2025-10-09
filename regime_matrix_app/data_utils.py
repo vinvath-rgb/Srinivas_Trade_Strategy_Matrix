@@ -3,66 +3,38 @@ import pandas as pd
 import yfinance as yf
 from pandas_datareader import data as pdr
 
-# =====================================================
-# 🧩 Helper: Normalize OHLC Columns
-# Ensures consistent 'Close' column and clean index
-# =====================================================
 def _normalize_ohlc_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
-
-    # Title-case keeps 'Adj Close' intact
     df = df.rename(columns=lambda c: str(c).strip().title())
-
-    # If only adjusted close is present, rename it
     if "Adj Close" in df.columns and "Close" not in df.columns:
         df = df.rename(columns={"Adj Close": "Close"})
-
-    # Remove duplicate columns if any
     df = df.loc[:, ~df.columns.duplicated()]
-
-    # Normalize index
     if isinstance(df.index, pd.DatetimeIndex):
         try:
             df.index = df.index.tz_localize(None)
         except Exception:
             pass
         df = df.sort_index()
-
     return df
 
-
-# =====================================================
-# 🧩 Safe Yahoo Download with retries & normalization
-# =====================================================
 def _safe_download(ticker: str, start=None, end=None) -> pd.DataFrame:
-    """Robust Yahoo fetch with retries and fallback period."""
     for attempt in range(3):
         try:
             df = yf.download(ticker, start=start, end=end, progress=False)
             df = _normalize_ohlc_columns(df)
             if not df.empty:
                 return df
-
-            # fallback: 12mo if date range fails
             df = yf.download(ticker, period="12mo", progress=False)
             df = _normalize_ohlc_columns(df)
             if not df.empty:
                 return df
-
         except Exception:
             pass
-
         time.sleep(0.8 * (attempt + 1))
-
     return pd.DataFrame()
 
-
-# =====================================================
-# 🧩 Fallback to Stooq
-# =====================================================
 def _fallback_stooq(ticker: str) -> pd.DataFrame:
-    """Try Stooq as backup if Yahoo fails."""
     try:
         df = pdr.DataReader(ticker, "stooq")
         df = df.sort_index()
@@ -71,35 +43,35 @@ def _fallback_stooq(ticker: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+def _is_tsx_like(t: str) -> bool:
+    t = (t or "").upper().strip()
+    return t.endswith(".TO") or t.endswith(".V") or t.endswith(".CN")
 
-# =====================================================
-# 🧩 Unified Fetch Function
-# =====================================================
 def fetch_prices_for_tickers(tickers, start=None, end=None, logger=None) -> dict:
-    """
-    Fetch prices for a list of tickers, trying Yahoo first then Stooq fallback.
-    Returns a dict {ticker: DataFrame} each with a 'Close' column.
-    """
     results = {}
     for tkr in tickers:
         tkr = tkr.strip().upper()
         if not tkr:
             continue
 
+        if _is_tsx_like(tkr):
+            if logger:
+                try: logger.info(f"Skipping unsupported TSX/venture ticker: {tkr}")
+                except Exception: pass
+            empty = pd.DataFrame()
+            empty.attrs["source"] = "unsupported-tsx"
+            results[tkr] = empty
+            continue
+
         if logger:
-            try:
-                logger.info(f"Fetching {tkr}")
-            except Exception:
-                pass
+            try: logger.info(f"Fetching {tkr}")
+            except Exception: pass
 
         df = _safe_download(tkr, start=start, end=end)
-
         if df.empty:
             if logger:
-                try:
-                    logger.info(f"Yahoo failed for {tkr}; trying Stooq fallback.")
-                except Exception:
-                    pass
+                try: logger.info(f"Yahoo failed for {tkr}; trying Stooq fallback.")
+                except Exception: pass
             df = _fallback_stooq(tkr)
             if not df.empty:
                 df.attrs["source"] = "stooq"
@@ -107,20 +79,12 @@ def fetch_prices_for_tickers(tickers, start=None, end=None, logger=None) -> dict
                 df.attrs["source"] = "none"
         else:
             df.attrs["source"] = "yahoo"
-
         results[tkr] = df
-
     return results
 
-
-# =====================================================
-# 🧩 Equal-weight Portfolio Helper (Legacy)
-# =====================================================
 def eq_weight_portfolio(close_wide: pd.DataFrame) -> pd.Series:
-    """Simple equal-weighted portfolio from a wide Close dataframe."""
     if close_wide.empty:
         return pd.Series(dtype=float)
-
     cl = close_wide.sort_index().dropna(how="any")
     ret = cl.pct_change()
     w = pd.DataFrame(1.0 / cl.shape[1], index=cl.index, columns=cl.columns)

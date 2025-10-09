@@ -1,11 +1,7 @@
-import io
 import pandas as pd
 import streamlit as st
 
-from regime_matrix_app.strategy_regime_matrix_app import run_matrix
-
-def _number_input(label, value, min_value=None, max_value=None, step=None, help=None):
-    return st.number_input(label, value=value, min_value=min_value, max_value=max_value, step=step, help=help)
+from regime_matrix_app.orchestrator import run_pipeline
 
 def _read_csv(upload) -> pd.DataFrame:
     if upload is None:
@@ -21,11 +17,11 @@ def main():
     st.title("📈 Strategy–Regime Matrix (Mean & Median Regimes)")
 
     with st.expander("How it works", expanded=False):
-        st.markdown("""
-        **Input formats**
-        - **LONG**: `Date,Ticker,Close`
-        - **WIDE**: `Date` + one column per ticker (each column is a close price series)
-        """)
+        st.markdown(
+            "**Input formats**\n"
+            "- **LONG**: `Date,Ticker,Close`\n"
+            "- **WIDE**: `Date` + one column per ticker (each column is a close price series)"
+        )
 
     c1, c2 = st.columns([3,2])
     with c1:
@@ -35,52 +31,95 @@ def main():
     with c2:
         csv_file = st.file_uploader("Upload CSV (optional)", type=["csv"])
 
-    # New controls:
     allow_partial = st.checkbox(
         "Allow partial basket (normalize weights across available tickers each day)",
         value=True
     )
-    k_mean = st.number_input("k_mean (threshold multiplier for mean)", value=1.2, step=0.05)
-    k_median = st.number_input("k_median (threshold multiplier for median)", value=1.0, step=0.05)
 
-    show_coverage = st.checkbox("Show data coverage per ticker", value=False)
-    show_vol_debug = st.checkbox("Show volatility debug panel", value=False)
+    # Regime options
+    use_percentiles = st.checkbox("Use percentile-based regimes (recommended)", value=True)
+    low_pct = st.slider("Low vol percentile", 0.10, 0.50, 0.40, 0.05)
+    high_pct = st.slider("High vol percentile", 0.50, 0.90, 0.60, 0.05)
 
-    run = st.button("Run Regime Backtest")
+    # Account options (margin only for now per user choice)
+    st.info("Account type: **Margin (long & short)** is enabled. Cash will be added later.")
+    commission_bps = st.number_input("Commission (bps, one-way)", value=1.0, step=0.5)
+    slippage_bps = st.number_input("Slippage (bps, one-way)", value=1.0, step=0.5)
+    borrow_apr = st.number_input("Short borrow APR (%)", value=3.0, step=0.5)
+
+    run = st.button("Run Pipeline")
 
     if run:
         tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
         df_csv = _read_csv(csv_file)
 
         with st.spinner("Running..."):
-            fig, heat, msg, extras = run_matrix(
+            results = run_pipeline(
                 tickers=tickers,
                 df_csv=df_csv,
                 start=start,
                 end=end,
                 allow_partial=allow_partial,
-                k_mean=k_mean,
-                k_median=k_median,
+                regime_mode="percentile" if use_percentiles else "threshold",
+                low_pct=low_pct,
+                high_pct=high_pct,
+                k_mean=1.2,
+                k_median=1.0,
+                strategy_keys=("sma_cross","bollinger","rsi"),
+                commission_bps=commission_bps,
+                slippage_bps=slippage_bps,
+                short_borrow_apr=borrow_apr/100.0,
             )
 
-        st.success(msg)
-        if show_coverage and "coverage_df" in extras:
+        st.success("Done.")
+
+        if not results:
+            st.error("No results.")
+            return
+
+        cov = results.get("coverage_df")
+        if cov is not None and not cov.empty:
             st.subheader("Data coverage by ticker")
-            st.dataframe(extras["coverage_df"])
+            st.dataframe(cov)
 
-        st.subheader("Regime table (last 60 rows)")
-        st.dataframe(heat)
+        regimes = results.get("regimes")
+        if regimes is not None and not regimes.empty:
+            st.subheader("Regime table (last 60 rows)")
+            cols = [c for c in ["Regime_Mean","Regime_Median"] if c in regimes.columns]
+            if cols:
+                heat = regimes[cols].tail(60)
+                st.dataframe(heat)
 
-        st.pyplot(fig)
+                csv = heat.to_csv(index=True).encode("utf-8")
+                st.download_button("Download regimes (CSV)", data=csv, file_name="regimes_tail60.csv", mime="text/csv")
 
-        if show_vol_debug:
-            st.subheader("Volatility Debug (last 15 rows)")
-            if "vol_debug_tail" in extras:
-                st.dataframe(extras["vol_debug_tail"])
-            col1, col2 = st.columns(2)
-            with col1:
-                if "regime_mean_counts" in extras:
-                    st.write("Regime_Mean counts:", extras["regime_mean_counts"])
-            with col2:
-                if "regime_median_counts" in extras:
-                    st.write("Regime_Median counts:", extras["regime_median_counts"])
+        eqw_curve = results.get("eqw_curve")
+        if eqw_curve is not None and not eqw_curve.empty:
+            st.subheader("Equal-Weight Portfolio")
+            st.line_chart(eqw_curve)
+
+        # Strategy leaderboard
+        per_strategy = results.get("per_strategy", {})
+        if per_strategy:
+            st.subheader("Strategy Performance (Margin Account)")
+            rows = []
+            for key, res in per_strategy.items():
+                stats = res.get("stats", {})
+                rows.append({
+                    "Strategy": key,
+                    "CAGR": round(stats.get("CAGR", float('nan'))*100, 2) if stats else None,
+                    "Vol": round(stats.get("Vol", float('nan'))*100, 2) if stats else None,
+                    "Sharpe": round(stats.get("Sharpe", float('nan')), 2) if stats else None,
+                    "MaxDD%": round(stats.get("MaxDD", float('nan'))*100, 2) if stats else None,
+                })
+            if rows:
+                st.dataframe(pd.DataFrame(rows).set_index("Strategy"))
+
+        # Strategy–Regime Matrix
+        matrix = results.get("matrix_table")
+        if matrix is not None and not matrix.empty:
+            st.subheader("Strategy–Regime Matrix (CAGR by regime)")
+            st.dataframe((matrix*100).round(2))
+
+            csvm = matrix.to_csv(index=True).encode("utf-8")
+            st.download_button("Download matrix (CSV)", data=csvm, file_name="strategy_regime_matrix.csv", mime="text/csv")

@@ -1,34 +1,34 @@
 import pandas as pd
 import numpy as np
 
+def compute_regimes(
+    eqw_series: pd.Series,
+    vol_window: int = 20,
+    mode: str = "percentile",   # "percentile" or "threshold"
+    k_mean: float = 1.2,
+    k_median: float = 1.0,
+    low_pct: float = 0.4,
+    high_pct: float = 0.6,
+) -> pd.DataFrame:
+    s = eqw_series.dropna().astype(float)
+    ret = s.pct_change()
+    vol = ret.rolling(vol_window, min_periods=vol_window).std() * np.sqrt(252)
 
-def compute_RSI(series: pd.Series, window: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain, index=series.index).rolling(window, min_periods=window).mean()
-    avg_loss = pd.Series(loss, index=series.index).rolling(window, min_periods=window).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return pd.Series(rsi, index=series.index)
+    out = pd.DataFrame(index=s.index)
+    out["vol"] = vol
 
-
-def compute_regimes(price: pd.Series, fast_sma: int = 10, slow_sma: int = 40,
-                    vol_window: int = 20, k_mean: float = 1.2, k_median: float = 1.0) -> pd.DataFrame:
-    df = pd.DataFrame({"Close": price}).dropna()
-    df["SMA_fast"] = df["Close"].rolling(fast_sma, min_periods=fast_sma).mean()
-    df["SMA_slow"] = df["Close"].rolling(slow_sma, min_periods=slow_sma).mean()
-    df["Ret"] = df["Close"].pct_change()
-    df["RealizedVol"] = df["Ret"].rolling(vol_window, min_periods=vol_window).std() * np.sqrt(252)
-    df["RV_Mean"] = df["RealizedVol"].rolling(vol_window, min_periods=vol_window).mean()
-    df["RV_Median"] = df["RealizedVol"].rolling(vol_window, min_periods=vol_window).median()
-
-    # Simple regime flags
-    df["Regime_Mean"] = np.where(df["RealizedVol"] > k_mean * df["RV_Mean"], "HighVol", "LowVol")
-    df["Regime_Median"] = np.where(df["RealizedVol"] > k_median * df["RV_Median"], "HighVol", "LowVol")
-
-    # Bonus momentum flag (not used yet)
-    df["Bull"] = (df["SMA_fast"] > df["SMA_slow"]).astype(int)
-
-    return df
-    
+    if mode == "threshold":
+        mean_vol = vol.rolling(vol_window, min_periods=vol_window).mean()
+        median_vol = vol.rolling(vol_window, min_periods=vol_window).median()
+        out["mean_vol"] = mean_vol
+        out["median_vol"] = median_vol
+        out["Regime_Mean"] = np.where(vol < k_mean*mean_vol, "LowVol", "HighVol")
+        out["Regime_Median"] = np.where(vol < k_median*median_vol, "LowVol", "HighVol")
+    else:
+        p_low = vol.rolling(252, min_periods=120).apply(lambda x: np.nanpercentile(x, low_pct*100), raw=False)
+        p_high = vol.rolling(252, min_periods=120).apply(lambda x: np.nanpercentile(x, high_pct*100), raw=False)
+        out["p_low"] = p_low
+        out["p_high"] = p_high
+        out["Regime_Mean"] = np.where(vol < p_low, "LowVol", np.where(vol > p_high, "HighVol", "MidVol"))
+        out["Regime_Median"] = out["Regime_Mean"]
+    return out
