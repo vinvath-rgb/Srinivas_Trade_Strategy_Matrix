@@ -46,19 +46,39 @@ def run_pipeline(
     else:
         m = fetch_prices_for_tickers(tickers, start=start, end=end, logger=logger)
         frames, cov = [], []
+for t, df in m.items():
+    if df is None or df.empty:
+        cov.append({"Ticker": t, "Source": df.attrs.get("source", "none") if df is not None else "none",
+                    "FirstDate": None, "LastDate": None, "Rows": 0})
+        continue
 
+    # --- FIXED CODE STARTS HERE ---
+    close_obj = df["Close"] if "Close" in df.columns else None
 
+    if close_obj is None:
+        continue  # skip if no Close column
 
+    # handle Series or DataFrame safely
+    if isinstance(close_obj, pd.Series):
+        s = close_obj.copy()
+        s.name = t
+    else:
+        # if Close itself is a sub-frame (common in wide yfinance data)
+        if t in close_obj.columns:
+            s = close_obj[t].copy()
+        else:
+            s = close_obj.iloc[:, 0].copy()
+        s.name = t
+    # --- FIXED CODE ENDS HERE ---
 
-
-
-
-
-
-
-
-
-        
+    frames.append(s)
+    cov.append({
+        "Ticker": t,
+        "Source": df.attrs.get("source", "unknown"),
+        "FirstDate": s.index.min(),
+        "LastDate": s.index.max(),
+        "Rows": int(s.notna().sum())
+    })
         #for t, df in m.items():
             #if df is None or df.empty:
                # cov.append({"Ticker": t, "Source": df.attrs.get("source","none") if df is not None else "none",
