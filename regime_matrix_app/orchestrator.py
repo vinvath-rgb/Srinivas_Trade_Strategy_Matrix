@@ -1,12 +1,3 @@
-from __future__ import annotations
-import pandas as pd
-from typing import Dict, List, Any, Optional
-
-from regime_matrix_app.data_utils import fetch_prices_for_tickers
-from regime_matrix_app.regime_detector_module import compute_regimes
-from regime_matrix_app.backtester import run_backtest
-from regime_matrix_app.strategy_logic import STRATEGY_REGISTRY
-
 def run_pipeline(
     tickers: List[str],
     df_csv: Optional[pd.DataFrame],
@@ -25,64 +16,78 @@ def run_pipeline(
     # 1) Prices
     if df_csv is not None and not df_csv.empty:
         cols_lower = {c.lower(): c for c in df_csv.columns}
-        if {"date","ticker","close"} <= set(cols_lower):
+        if {"date", "ticker", "close"} <= set(cols_lower):
             df_csv = df_csv.rename(columns={
                 cols_lower["date"]: "Date",
                 cols_lower["ticker"]: "Ticker",
                 cols_lower["close"]: "Close",
             })
             df_csv["Date"] = pd.to_datetime(df_csv["Date"])
-            prices = df_csv.pivot_table(index="Date", columns="Ticker", values="Close").sort_index()
+            prices = (
+                df_csv.pivot_table(index="Date", columns="Ticker", values="Close")
+                .sort_index()
+            )
         else:
             df_csv = df_csv.copy()
             df_csv["Date"] = pd.to_datetime(df_csv["Date"])
             prices = df_csv.set_index("Date").sort_index()
+
         coverage_df = pd.DataFrame([
-            {"Ticker": c, "Source": "csv",
-             "FirstDate": s.dropna().index.min(), "LastDate": s.dropna().index.max(),
-             "Rows": int(s.dropna().shape[0])}
+            {
+                "Ticker": c,
+                "Source": "csv",
+                "FirstDate": s.dropna().index.min(),
+                "LastDate": s.dropna().index.max(),
+                "Rows": int(s.dropna().shape[0]),
+            }
             for c, s in prices.items()
         ]).sort_values("FirstDate", na_position="first")
+
     else:
         m = fetch_prices_for_tickers(tickers, start=start, end=end, logger=logger)
         frames, cov = [], []
-for t, df in m.items():
-    if df is None or df.empty:
-        cov.append({"Ticker": t, "Source": df.attrs.get("source", "none") if df is not None else "none",
-                    "FirstDate": None, "LastDate": None, "Rows": 0})
-        continue
 
-    # --- FIXED CODE STARTS HERE ---
-    close_obj = df["Close"] if "Close" in df.columns else None
+        for t, df in m.items():
+            if df is None or df.empty:
+                cov.append({
+                    "Ticker": t,
+                    "Source": (df.attrs.get("source", "none") if df is not None else "none"),
+                    "FirstDate": None,
+                    "LastDate": None,
+                    "Rows": 0,
+                })
+                continue
 
-    if close_obj is None:
-        continue  # skip if no Close column
+            # --- robust "Close" extraction ---
+            close_obj = df["Close"] if "Close" in df.columns else None
+            if close_obj is None:
+                continue  # skip if no Close column
 
-    # handle Series or DataFrame safely
-    if isinstance(close_obj, pd.Series):
-        s = close_obj.copy()
-        s.name = t
-    else:
-        # if Close itself is a sub-frame (common in wide yfinance data)
-        if t in close_obj.columns:
-            s = close_obj[t].copy()
-        else:
-            s = close_obj.iloc[:, 0].copy()
-        s.name = t
-    # --- FIXED CODE ENDS HERE ---
+            if isinstance(close_obj, pd.Series):
+                s = close_obj.copy()
+                s.name = t
+            else:
+                # Close is a sub-frame -> pick matching column if present, else first col
+                if t in close_obj.columns:
+                    s = close_obj[t].copy()
+                else:
+                    s = close_obj.iloc[:, 0].copy()
+                s.name = t
+            # ---------------------------------
 
-    frames.append(s)
-    cov.append({
-        "Ticker": t,
-        "Source": df.attrs.get("source", "unknown"),
-        "FirstDate": s.index.min(),
-        "LastDate": s.index.max(),
-        "Rows": int(s.notna().sum())
-    })
-    prices = pd.concat(frames, axis=1).sort_index()
-    coverage_df = pd.DataFrame(cov).sort_values("FirstDate", na_position="first")
+            frames.append(s)
+            cov.append({
+                "Ticker": t,
+                "Source": df.attrs.get("source", "unknown"),
+                "FirstDate": s.index.min(),
+                "LastDate": s.index.max(),
+                "Rows": int(s.notna().sum()),
+            })
 
-    # 2) EQW curve
+        prices = pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
+        coverage_df = pd.DataFrame(cov).sort_values("FirstDate", na_position="first")
+
+    # 2) Equal-weight portfolio curve
     cl = prices.copy()
     if allow_partial:
         valid = cl.notna()
@@ -92,7 +97,7 @@ for t, df in m.items():
     else:
         cl = cl.dropna(how="any")
         port_ret = cl.pct_change().mean(axis=1).fillna(0.0)
-    eqw_curve = (1 + port_ret).cumprod() * 100.0
+    eqw_curve = (1.0 + port_ret).cumprod() * 100.0
 
     # 3) Regimes
     if regime_mode == "percentile":
@@ -126,25 +131,28 @@ for t, df in m.items():
             continue
         df.columns = ["ret", "regime"]
         grp = df.groupby("regime")["ret"]
+
         def cagr(x):
             n = len(x)
-            return (1+x).prod()**(252/n)-1 if n>0 else float("nan")
+            return (1 + x).prod() ** (252 / n) - 1 if n > 0 else float("nan")
+
         out = grp.apply(cagr).to_dict()
         out["Strategy"] = key
         matrix_rows.append(out)
 
     if matrix_rows:
-        regimes_order = [c for c in ["LowVol","MidVol","HighVol"] if c in matrix_rows[0].keys()]
-        matrix_table = pd.DataFrame(matrix_rows).set_index('Strategy')
+        regimes_order = [c for c in ["LowVol", "MidVol", "HighVol"] if c in matrix_rows[0].keys()]
+        matrix_table = pd.DataFrame(matrix_rows).set_index("Strategy")
         matrix_table = matrix_table.reindex(columns=regimes_order)
     else:
         matrix_table = pd.DataFrame()
 
-        return {
-            "coverage_df": coverage_df,
-            "prices": prices,
-            "eqw_curve": eqw_curve,
-            "regimes": regimes,
-            "per_strategy": per_strategy,
-            "matrix_table": matrix_table,
-        }
+    return {
+        "coverage_df": coverage_df,
+        "prices": prices,
+        "eqw_curve": eqw_curve,
+        "regimes": regimes,
+        "per_strategy": per_strategy,
+        "matrix_table": matrix_table,
+    }
+    
