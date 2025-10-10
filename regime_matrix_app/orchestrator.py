@@ -79,18 +79,8 @@ for t, df in m.items():
         "LastDate": s.index.max(),
         "Rows": int(s.notna().sum())
     })
-        #for t, df in m.items():
-            #if df is None or df.empty:
-               # cov.append({"Ticker": t, "Source": df.attrs.get("source","none") if df is not None else "none",
-                #            "FirstDate": None, "LastDate": None, "Rows": 0})
-                #continue
-            #s = df["Close"].rename(t)
-            #frames.append(s)
-            #cov.append({"Ticker": t, "Source": df.attrs.get("source","unknown"),
-             #           "FirstDate": s.index.min(), "LastDate": s.index.max(), "Rows": int(s.notna().sum())})
-            
-        prices = pd.concat(frames, axis=1).sort_index()
-        coverage_df = pd.DataFrame(cov).sort_values("FirstDate", na_position="first")
+    prices = pd.concat(frames, axis=1).sort_index()
+    coverage_df = pd.DataFrame(cov).sort_values("FirstDate", na_position="first")
 
     # 2) EQW curve
     cl = prices.copy()
