@@ -140,11 +140,11 @@ for t, df in m.items():
     else:
         matrix_table = pd.DataFrame()
 
-    return {
-        "coverage_df": coverage_df,
-        "prices": prices,
-        "eqw_curve": eqw_curve,
-        "regimes": regimes,
-        "per_strategy": per_strategy,
-        "matrix_table": matrix_table,
-    }
+        return {
+            "coverage_df": coverage_df,
+            "prices": prices,
+            "eqw_curve": eqw_curve,
+            "regimes": regimes,
+            "per_strategy": per_strategy,
+            "matrix_table": matrix_table,
+        }
